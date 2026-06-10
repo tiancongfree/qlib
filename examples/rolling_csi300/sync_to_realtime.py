@@ -15,6 +15,7 @@ Usage:
     # Dry-run first to see what would be traded, then remove --dry-run to execute.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ if str(Path(__file__).parent.parent.parent) in sys.path:
     sys.path.remove(str(Path(__file__).parent.parent.parent))
 
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', write_through=True)
 
 import pandas as pd
 from qlib import auto_init
@@ -297,13 +298,14 @@ def main(
         except Exception:
             pass
 
+    # Connect with retries
     print(f"\nConnecting to easyths at {host}:{port} ...")
     last_err = None
+    client = None
+    elapsed = 0
     for attempt in range(3):
         try:
-            # Clear stale server-side connections before each attempt
             _send_rst()
-
             client = TradeClient(host=host, port=port, api_key=resolved_key, timeout=60)
             health = client.health_check()
             if health.get("success"):
@@ -313,18 +315,20 @@ def main(
         except Exception as e:
             last_err = str(e)
             client = None
-            _send_rst()  # clean up on timeout/error too
+            _send_rst()
         if attempt < 2:
             wait = (attempt + 1) * 10
-            print(f"  Connection failed, retrying in {wait}s... ({last_err})")
+            print(f"  Connection failed ({attempt+2}/3, 已过{elapsed}s/共30s), retrying in {wait}s... ({last_err})")
             _time.sleep(wait)
+            elapsed += wait
     else:
-        print(f"ERROR: Cannot connect to easyths after 3 attempts: {last_err}")
+        print(f"  Connection unstable after 3 attempts: {last_err}")
         sys.exit(1)
 
     with client:
-        # Query account total assets to scale positions automatically
+        print("  Querying account funds...", end="", flush=True)
         funds = client.query_funds()
+        print(" OK", flush=True)
         if not funds.get("success"):
             print(f"ERROR: Failed to query funds: {funds.get('message')}")
             sys.exit(1)

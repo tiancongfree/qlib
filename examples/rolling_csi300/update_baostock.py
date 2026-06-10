@@ -72,6 +72,8 @@ def build_existing_last_values(stock_list, calendar):
             "last_amount": amount[bin_idx],
         }
     return results
+
+
 def download(stock_list, start, end):
     """Download baostock data for all stocks."""
     lg = bs.login()
@@ -85,8 +87,13 @@ def download(stock_list, start, end):
         batch = stock_list[i : i + chunk]
         batch_id = i // chunk + 1
         for fname in batch:
+            is_bj = fname.startswith("bj")
             bs_sym = fname_to_bs(fname)
+            print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
             try:
+                if is_bj:
+                    print(" skip (北交所)", flush=True)
+                    continue
                 # adjustflag=2: forward-adjusted (all prices at current level)
                 rs = bs.query_history_k_data_plus(
                     bs_sym,
@@ -98,19 +105,23 @@ def download(stock_list, start, end):
                 )
                 if rs.error_code != "0":
                     fail += 1
+                    print(" FAIL", flush=True)
                     continue
                 rows = []
                 while rs.next():
                     rows.append(rs.get_row_data())
                 if not rows:
+                    print(" empty", flush=True)
                     continue
                 df = pd.DataFrame(rows, columns=rs.fields)
                 df["symbol"] = fname.lower()
                 all_data.append(df)
+                print(" OK", flush=True)
             except Exception:
                 fail += 1
+                print(" ERROR", flush=True)
         progress = min(i + chunk, total)
-        print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed)")
+        print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed)", flush=True)
         time.sleep(0.3)
     bs.logout()
     if not all_data:

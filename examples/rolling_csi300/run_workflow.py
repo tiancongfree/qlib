@@ -37,7 +37,8 @@ def step_header(step: int, title: str):
 def run(cmd: list, step_name: str) -> bool:
     print(f"  Running: {' '.join(str(a) for a in cmd)}")
     t0 = time.time()
-    result = subprocess.run(cmd, cwd=HERE)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    result = subprocess.run(cmd, cwd=HERE, env=env)
     elapsed = time.time() - t0
     if result.returncode == 0:
         print(f"  [{step_name}] Done in {elapsed:.1f}s\n")
