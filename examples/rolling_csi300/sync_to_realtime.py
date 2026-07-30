@@ -207,8 +207,6 @@ def sync_positions(
                 else:
                     r = client.market_buy(stock_code=ths_code, quantity=qty)
                 status = "OK" if r.get("success") else f"FAIL: {_sanitize(r.get('message', ''))}"
-                if status.startswith("FAIL") and "不支持市价委托" in status:
-                    status += "  （科创板不支持市价单，跳过）"
                 print(f"    -> {status}", flush=True)
             except TradeClientError as e:
                 print(f"    -> ERROR: {e}", flush=True)
@@ -328,10 +326,11 @@ def main(
     with client:
         print("  Querying account funds...", end="", flush=True)
         funds = client.query_funds()
-        print(" OK", flush=True)
         if not funds.get("success"):
+            print(" FAILED")
             print(f"ERROR: Failed to query funds: {funds.get('message')}")
             sys.exit(1)
+        print(" OK", flush=True)
         total_assets = float(funds["data"].get("总资产", 0))
         max_total = total_assets * invest_ratio
         print(f"  Account total assets: {total_assets:.2f}")

@@ -212,7 +212,7 @@ class Rolling:
             R.delete_exp(experiment_name=self.rolling_exp)  # We should remove the rolling experiments.
         except ValueError:
             self.logger.info("No previous rolling results")
-        trainer = TrainerR(experiment_name=self.rolling_exp)
+        trainer = TrainerR(experiment_name=self.rolling_exp, call_in_subproc=True)
         trainer(task_l)
 
     def _ens_rolling(self):

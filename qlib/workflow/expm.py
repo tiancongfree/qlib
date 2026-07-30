@@ -233,12 +233,20 @@ class ExpManager:
             # So we supported it in the interface wrapper
             pr = urlparse(self.uri)
             if pr.scheme == "file":
-                with FileLock(Path(os.path.join(pr.netloc, pr.path.lstrip("/"), "filelock"))):  # pylint: disable=E0110
-                    return self.create_exp(experiment_name), True
+                try:
+                    with FileLock(Path(os.path.join(pr.netloc, pr.path.lstrip("/"), "filelock"))):  # pylint: disable=E0110
+                        return self.create_exp(experiment_name), True
+                except ExpAlreadyExistError:
+                    self._restore_deleted_experiment(experiment_name)
+                    return (
+                        self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
+                        False,
+                    )
             # NOTE: for other schemes like http, we double check to avoid create exp conflicts
             try:
                 return self.create_exp(experiment_name), True
             except ExpAlreadyExistError:
+                self._restore_deleted_experiment(experiment_name)
                 return (
                     self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
                     False,
@@ -361,6 +369,16 @@ class MLflowExpManager(ExpManager):
             raise e
 
         return MLflowExperiment(experiment_id, experiment_name, self.uri)
+
+    def _restore_deleted_experiment(self, experiment_name: Text):
+        """Restore a deleted experiment by name so it can be reused."""
+        deleted_exps = self.client.search_experiments(view_type=ViewType.DELETED_ONLY)
+        for exp in deleted_exps:
+            if exp.name == experiment_name:
+                self.client.restore_experiment(exp.experiment_id)
+                logger.warning(f"Restored deleted experiment '{experiment_name}' from trash.")
+                return
+        raise ValueError(f"No deleted experiment found with name '{experiment_name}' to restore.")
 
     def _get_exp(self, experiment_id=None, experiment_name=None):
         """

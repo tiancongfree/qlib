@@ -24,7 +24,14 @@ from ruamel.yaml import YAML
 from qlib import auto_init
 from qlib.data import D
 from qlib.contrib.rolling.base import Rolling
+from qlib.utils.pickle_utils import add_safe_class
+import custom_handler  # noqa: F401 - register handler for pickle
 from save_positions import save_positions_to_csv
+
+# Register custom classes so subprocesses can deserialize them
+add_safe_class("custom_handler", "Alpha158Momentum")
+add_safe_class("custom_handler", "Alpha158Industry")
+add_safe_class("custom_handler", "IndustryProcessor")
 
 CONF_PATH = Path(__file__).parent / "rolling_config.yaml"
 

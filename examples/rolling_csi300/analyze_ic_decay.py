@@ -71,7 +71,7 @@ def analyze_ic_decay(
         return
 
     # Get the last recorder (the combined ensemble result)
-    rid = recorders[-1]
+    rid = list(recorders.keys())[-1]
     rec = R.get_recorder(experiment_name=exp_name, recorder_id=rid)
 
     # Step 2: Load pred and label
@@ -90,8 +90,8 @@ def analyze_ic_decay(
     # pred and label are DataFrames with DatetimeIndex and stock columns
     if isinstance(pred, pd.DataFrame):
         # Flatten to series, aligning by (date, stock)
-        pred_s = pred.stack()
-        label_s = label.stack()
+        pred_s = pred.stack().droplevel(-1)
+        label_s = label.stack().droplevel(-1)
         combined = pd.DataFrame({"pred": pred_s, "label": label_s}).dropna()
     elif isinstance(pred, pd.Series):
         combined = pd.DataFrame({"pred": pred, "label": label}).dropna()

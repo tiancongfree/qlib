@@ -79,6 +79,12 @@ def download(stock_list, start, end):
     lg = bs.login()
     if lg.error_code != "0":
         raise RuntimeError(f"baostock login failed: {lg.error_msg}")
+    # Pre-filter: skip 北交所 stocks (bj.*) which are never selected
+    a_share_list = [s for s in stock_list if not s.startswith("bj")]
+    bj_skipped = len(stock_list) - len(a_share_list)
+    print(f"  Filtered out {bj_skipped} 北交所 stocks, {len(a_share_list)} remaining")
+    stock_list = a_share_list
+
     all_data = []
     total = len(stock_list)
     fail = 0
@@ -87,13 +93,9 @@ def download(stock_list, start, end):
         batch = stock_list[i : i + chunk]
         batch_id = i // chunk + 1
         for fname in batch:
-            is_bj = fname.startswith("bj")
             bs_sym = fname_to_bs(fname)
             print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
             try:
-                if is_bj:
-                    print(" skip (北交所)", flush=True)
-                    continue
                 # adjustflag=2: forward-adjusted (all prices at current level)
                 rs = bs.query_history_k_data_plus(
                     bs_sym,

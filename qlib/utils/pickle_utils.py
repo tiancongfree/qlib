@@ -49,12 +49,18 @@ SAFE_PICKLE_CLASSES: Set[Tuple[str, str]] = {
     ("qlib.data.dataset.handler", "DataHandler"),
     ("qlib.data.dataset.handler", "DataHandlerLP"),
     ("qlib.data.dataset.loader", "StaticDataLoader"),
+    # qlib contrib data handlers
+    ("qlib.contrib.data.handler", "Alpha158"),
+    ("qlib.contrib.data.handler", "Alpha360"),
+    ("qlib.contrib.data.handler", "Alpha158vwap"),
+    ("qlib.contrib.data.handler", "Alpha360vwap"),
 }
 
 
 TRUSTED_MODULE_PREFIXES = (
     "pandas",
     "numpy",
+    "qlib",
 )
 
 
