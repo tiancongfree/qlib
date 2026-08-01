@@ -36,6 +36,7 @@ add_safe_class("custom_handler", "DvRatioProcessor")
 add_safe_class("custom_handler", "Alpha158DvRatio")
 add_safe_class("custom_handler", "VolatilityTimingStrategy")
 add_safe_class("custom_handler", "IndustryCappedStrategy")
+add_safe_class("custom_handler", "MinTradeValueStrategy")
 
 DEFAULT_CONF = Path(__file__).parent / "rolling_config.yaml"
 
