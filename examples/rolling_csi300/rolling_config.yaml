@@ -1,6 +1,6 @@
 benchmark: SH000300
 data_handler_config: &id001
-  end_time: '2026-07-24'
+  end_time: '2026-07-31'
   fit_end_time: 2018-12-31
   fit_start_time: 2008-01-01
   instruments: csi300
@@ -10,7 +10,7 @@ port_analysis_config: &id002
   backtest:
     account: 1000000
     benchmark: SH000300
-    end_time: '2026-07-24'
+    end_time: '2026-07-31'
     exchange_kwargs:
       close_cost: 0.0015
       deal_price: close

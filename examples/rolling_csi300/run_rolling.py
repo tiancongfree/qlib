@@ -32,12 +32,23 @@ from save_positions import save_positions_to_csv
 add_safe_class("custom_handler", "Alpha158Momentum")
 add_safe_class("custom_handler", "Alpha158Industry")
 add_safe_class("custom_handler", "IndustryProcessor")
+add_safe_class("custom_handler", "VolatilityTimingStrategy")
+add_safe_class("custom_handler", "IndustryCappedStrategy")
 
-CONF_PATH = Path(__file__).parent / "rolling_config.yaml"
+DEFAULT_CONF = Path(__file__).parent / "rolling_config.yaml"
 
 
-def _find_latest_rolling_exp() -> str:
-    """Find the most recent rolling_models_* experiment in mlruns."""
+def _find_latest_rolling_exp(handler_class: str = None) -> str:
+    """Find the most recent rolling_models_* experiment compatible with the handler.
+
+    Parameters
+    ----------
+    handler_class : str, optional
+        Expected handler class name (e.g. ``Alpha158Industry``). If given, only
+        experiments whose runs reference a handler cache of this class are
+        considered, preventing --skip_train from reusing models trained with a
+        different handler.
+    """
     mlruns_dir = Path(__file__).parent / "mlruns"
     if not mlruns_dir.exists():
         return None
@@ -48,12 +59,34 @@ def _find_latest_rolling_exp() -> str:
     ]
     if not rolling_exps:
         return None
+    # Filter by handler class if requested
+    if handler_class is not None:
+        compatible = []
+        for e in rolling_exps:
+            runs = client.search_runs([e.experiment_id])
+            if not runs:
+                continue
+            # All runs in a rolling experiment share the same handler param
+            handler_param = runs[0].data.params.get("dataset.kwargs.handler", "")
+            if handler_class in handler_param:
+                compatible.append(e)
+        rolling_exps = compatible
+    if not rolling_exps:
+        return None
     # Use the one with the latest creation time
     rolling_exps.sort(key=lambda e: e.creation_time or 0)
     return rolling_exps[-1].name
 
 
-def main(skip_train: bool = False):
+def _expected_handler_class() -> str:
+    """Return the handler class name of the current config."""
+    with CONF_PATH.open("r") as f:
+        yaml = YAML(typ="safe", pure=True)
+        conf = yaml.load(f)
+    return conf["task"]["dataset"]["kwargs"]["handler"]["class"]
+
+
+def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_csi300_lgbm"):
     """Run rolling training + backtest.
 
     Parameters
@@ -62,7 +95,14 @@ def main(skip_train: bool = False):
         If True, skip model training and only re-run ensemble + backtest
         (useful when models are already trained and you only want to re-export
         positions or re-run portfolio analysis with different parameters).
+    conf : str, optional
+        Path to the rolling config yaml. Defaults to ``rolling_config.yaml``.
+    exp_name : str
+        Name of the output (combined) mlflow experiment. Defaults to
+        ``rolling_csi300_lgbm``.
     """
+    global CONF_PATH
+    CONF_PATH = Path(conf) if conf else DEFAULT_CONF
     auto_init(provider_uri="~/.qlib/qlib_data/cn_data", region="cn")
 
     # Use latest available date as config end_time
@@ -89,9 +129,9 @@ def main(skip_train: bool = False):
 
     # When skipping training, reuse existing rolling_models experiment
     rolling_exp = None
-    exp_name = "rolling_csi300_lgbm"
     if skip_train:
-        rolling_exp = _find_latest_rolling_exp()
+        handler_class = _expected_handler_class()
+        rolling_exp = _find_latest_rolling_exp(handler_class=handler_class)
         if rolling_exp is None:
             print("ERROR: No existing rolling_models_* experiment found. Run without --skip_train first.")
             sys.exit(1)
@@ -113,7 +153,7 @@ def main(skip_train: bool = False):
     )
 
     print("=" * 60)
-    print("  Rolling Retraining: LightGBM + Alpha158 on CSI300")
+    print(f"  Rolling Retraining: LightGBM + {Path(CONF_PATH).stem} on CSI300")
     print("=" * 60)
     print(f"  Step: 60 trading days (~quarterly)")
     print(f"  Horizon: 20 days")

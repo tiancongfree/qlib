@@ -7,10 +7,122 @@ import pandas as pd
 from qlib.data.dataset.processor import Processor
 from qlib.contrib.data.handler import Alpha158
 from qlib.contrib.data.loader import Alpha158DL
+from qlib.contrib.strategy import TopkDropoutStrategy
+from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+from qlib.data import D
+import copy
+
+
+class VolatilityTimingStrategy(TopkDropoutStrategy):
+    """Dynamic topk based on CSI 300 volatility + trend regime.
+
+    牛市高波（acceleration）→  stay invested
+    熊市高波（panic）    →  cut hard
+    牛市低波（calm uptrend）→ full attack
+    熊市低波（quiet downtrend）→ light position
+    """
+
+    def __init__(
+        self,
+        *,
+        vol_window=20,
+        trend_window=120,
+        vol_pctile_high=0.75,
+        vol_pctile_low=0.30,
+        high_topk=12,
+        mid_topk=20,
+        low_topk=30,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.vol_window = vol_window
+        self.trend_window = trend_window
+        self.vol_pctile_high = vol_pctile_high
+        self.vol_pctile_low = vol_pctile_low
+        self.high_topk = high_topk
+        self.mid_topk = mid_topk
+        self.low_topk = low_topk
+        self._market_data = None
+
+    def _precompute_market(self):
+        cal = D.calendar()
+        start = str(cal[0].date())
+        end = str(cal[-1].date())
+
+        close = D.features(
+            D.instruments("csi300"), ["$close"], start_time=start, end_time=end
+        )
+        market = close.groupby(level="datetime").mean().squeeze()
+        ret = market.pct_change(fill_method=None).dropna()
+
+        vol = ret.rolling(self.vol_window).std() * np.sqrt(252)
+        ma = market.rolling(self.trend_window).mean()
+
+        df = pd.DataFrame({"close": market, "ma": ma, "vol": vol}).dropna()
+        # Rolling vol percentile over trailing 2yr (~500 trading days)
+        df["vol_pctile"] = (
+            df["vol"]
+            .rolling(500)
+            .apply(lambda x: (x.iloc[-1] >= x).mean(), raw=False)
+        )
+        # Trend: close / MA - 1
+        df["trend"] = df["close"] / df["ma"] - 1
+
+        self._market_data = df
+
+    def _regime_topk(self, cur_ts):
+        df = self._market_data
+        past = df[df.index <= cur_ts]
+        if len(past) == 0:
+            return self.mid_topk
+
+        row = past.iloc[-1]
+        is_bull = row["trend"] > -0.02  # slightly forgiving
+        is_high_vol = row["vol_pctile"] >= self.vol_pctile_high
+        is_low_vol = row["vol_pctile"] <= self.vol_pctile_low
+
+        if is_bull:
+            if is_low_vol:
+                return self.low_topk     # 牛市低波 → 满仓进攻
+            elif is_high_vol:
+                return self.mid_topk     # 牛市高波 → 正常持有（加速阶段）
+            else:
+                return self.mid_topk     # 中性
+        else:
+            if is_high_vol:
+                return self.high_topk    # 熊市高波 → 轻仓防守
+            elif is_low_vol:
+                return self.mid_topk     # 熊市低波 → 轻微防御
+            else:
+                return self.mid_topk
+
+    def generate_trade_decision(self, execute_result=None):
+        if self._market_data is None:
+            self._precompute_market()
+
+        trade_step = self.trade_calendar.get_trade_step()
+        _, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+
+        self.topk = self._regime_topk(pd.Timestamp(trade_end_time))
+        return super().generate_trade_decision(execute_result)
 
 
 class IndustryProcessor(Processor):
     """Add industry-relative features (industry mean, excess, rank)."""
+
+    # Fundamental feature names handled by FundamentalProcessor; the IndustryProcessor
+    # must NOT touch them (its substring matching would wrongly pick up e.g. "MA" in
+    # "GROSSPROFIT_MARGIN").
+    FUNDAMENTAL_FEATURES = set(
+        [
+            "PE_TTM", "PB", "PS_TTM", "DV_TTM", "LOG_MV", "CIRC_MV", "TURNOVER",
+            "ROE", "ROE_WAA", "ROA", "GROSSPROFIT_MARGIN", "NETPROFIT_MARGIN",
+            "DEBT_TO_ASSETS", "CURRENT_RATIO", "QUICK_RATIO", "OR_YOY",
+            "NETPROFIT_YOY", "Q_GR_YOY", "Q_PROFIT_YOY", "OCF_TO_OR", "EPS",
+            "ROE_YOY", "ROE_WAA_YOY", "ROA_YOY", "GM_YOY", "NM_YOY",
+            "LEVERAGE_YOY", "EPS_YOY",
+        ]
+    )
 
     def __init__(self, industry_map_path=None):
         if industry_map_path is None:
@@ -45,6 +157,8 @@ class IndustryProcessor(Processor):
         new_cols = {}
         for col in df.columns:
             col_name = col[1] if is_multi else col
+            if col_name in self.FUNDAMENTAL_FEATURES:
+                continue  # handled by FundamentalProcessor
             if not any(k in str(col_name) for k in key_feats):
                 continue
             values = df[col].values
@@ -101,3 +215,105 @@ class Alpha158Industry(Alpha158):
         names += ["ACCL%d" % d for d in [20, 40]]
 
         return fields, names
+
+
+class IndustryCappedStrategy(TopkDropoutStrategy):
+    """TopK with gradual industry cap — phases out excess gradually to limit turnover."""
+
+    def __init__(self, *, max_per_industry=4, industry_map_path=None, **kwargs):
+        super().__init__(**kwargs)
+        self.max_per_industry = max_per_industry
+        if industry_map_path is None:
+            industry_map_path = Path(__file__).parent / "industry_map.pkl"
+        with open(industry_map_path, "rb") as f:
+            self.industry_map = pickle.load(f)
+
+    def _industry_code(self, stock):
+        return self.industry_map.get(stock.lower(), "UNKNOWN")
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        def get_first_n(li, n):
+            return list(li)[:n]
+        def get_last_n(li, n):
+            return list(li)[-n:]
+
+        current_temp = copy.deepcopy(self.trade_position)
+        current_stock_list = current_temp.get_stock_list()
+
+        # --- Step 1: normal TopkDropout candidate selection ---
+        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        today = get_first_n(
+            pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+            self.n_drop + self.topk - len(last),
+        )
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+
+        # --- Step 2: apply industry cap to the candidate list ---
+        # Count current industry exposure
+        cur_ind_count = {}
+        for s in current_stock_list:
+            ind = self._industry_code(s)
+            cur_ind_count[ind] = cur_ind_count.get(ind, 0) + 1
+
+        capped = []
+        for stock in comb:
+            ind = self._industry_code(stock)
+            cnt = sum(1 for s in capped if self._industry_code(s) == ind)
+            if cnt < self.max_per_industry:
+                capped.append(stock)
+        comb = pd.Index(capped)
+
+        # --- Step 3: normal sell/buy with the capped candidate list ---
+        sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        buy = today[: len(sell) + self.topk - len(last)]
+
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.SELL
+            ):
+                continue
+            if code in sell:
+                time_per_step = self.trade_calendar.get_freq()
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
+                sell_amount = current_temp.get_stock_amount(code=code)
+                sell_order = Order(
+                    stock_id=code, amount=sell_amount,
+                    start_time=trade_start_time, end_time=trade_end_time, direction=Order.SELL,
+                )
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, _ = self.trade_exchange.deal_order(sell_order, position=current_temp)
+                    cash += trade_val - trade_cost
+
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        for code in buy:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            ):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code, amount=buy_amount,
+                start_time=trade_start_time, end_time=trade_end_time, direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
