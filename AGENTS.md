@@ -6,9 +6,9 @@
 
 - **策略**: rolling 滚动重训 + LightGBM(Alpha158Industry) + TopkDropoutStrategy, CSI300 内选股
 - **市场**: CSI300, 回测区间 2020-01~2026-07
-- **基准配置**: `rolling_config.yaml` (已固化 **n_drop=5**, topk=30)
-- **当前 baseline**: `rolling_csi300_lgbm_ndrop5` (mlruns 实验)
-- **关键指标** (n_drop=5, 2020-2026): 年化超额 ~23.9%, IR 1.94, 最大回撤 -15%, 期末净值 4.40
+- **基准配置**: `rolling_config.yaml` (已固化 **n_drop=1**, topk=30)
+- **当前 baseline**: `rolling_csi300_lgbm_ndrop1` (mlruns 实验)
+- **关键指标** (n_drop=1, 2020-2026, 净成本): 年化超额 ~17.1%, IR 1.29, 最大回撤 -19.8%, 换手 16/yr
 
 ## 核心研究结论
 
@@ -20,9 +20,21 @@
 - SingleWeightCapStrategy 已从 custom_handler.py 移除
 - 结论: 单股上限严重伤绩效 (IR 1.21→0.72, 回撤 -17.6%→-25.3%)。权重漂移是动量增强来源, 非 bug
 
-### 3. n_drop 换手率敏感性
-- n_drop=5 (换手76/yr) 是甜点, 收益倒 U 型 (见 style_profile.md)
+### 3. n_drop 换手率敏感性 (净成本口径, 已修正)
+- **毛收益**: n_drop=5 (换手80/yr) 仍最优 (20.5%), 毛口径倒 U 型成立
+- **净收益 (关键)**: n_drop=1 最优 (17.1%, 净IR 1.29, 回撤 -19.8%); n_drop=5 净仅 12.9%
+  - n_drop=5 增量毛 alpha (+2.3pp) 远抵不上成本拖累 (+6.1pp), 高换手被成本吃掉
+  - 敏感性表 (2020-2026, 净成本): n_drop=1: 17.1% | 2: 14.7% | 3: 14.1% | 5: 12.9%
 - 结论: 机构暴力靠新信号源而非提高换手频率
+- **注意**: 早期"n_drop=5 甜点 23.9%/IR 1.94"基于不含成本口径, 且受回测非确定性 bug 污染, 已作废
+
+### 3b. 回测非确定性 bug (已修复, 重要!)
+- **症状**: 同一命令多次回测结果不同 (ndrop=1 时 0.183~0.207 波动 ±2.4pp), 持仓在 2022-07-05 等日期分歧
+- **根因**: `qlib/backtest/position.py` `get_stock_list` 用 `list(set(...))` 迭代, set 顺序依赖 PYTHONHASHSEED → 每次进程结果不同
+- **影响**: 仅 n_drop=1 敏感 (每次只换1只, 边界选择对顺序敏感); n_drop>=2 稳定 (已验证 nd2/3/5 复现一致)
+- **修复**: `get_stock_list` 返回前 `stock_list.sort()`, 已 patch 到 qlib 源码 (~/qlib/qlib/backtest/position.py:424)
+- **验证**: patch 后 ndrop=1 连跑两次完全一致; ndrop=2/3/5 结果与 patch 前一致 (无偏差)
+- **教训**: 任何回测对比前必须确认确定性; 早期 n_drop 敏感性结论受此污染
 
 ### 4. 因子衰减分析
 - 无结构性衰减 (2020-2022 IC 0.077 vs 2023-2026 IC 0.077)
@@ -55,7 +67,7 @@ cd examples/rolling_csi300
 python3 run_rolling.py
 
 # 跳过训练, 复用已有 rolling_models 实验, 只跑 ensemble + 回测
-python3 run_rolling.py --skip-train --conf rolling_config_ndrop5.yaml --exp-name rolling_csi300_lgbm_ndrop5
+python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rolling_csi300_lgbm_ndrop1
 ```
 
 **重要**: 必须在 `examples/rolling_csi300/` 目录下运行! qlib 默认 mlflow tracking_uri 相对 cwd (否则 RecorderCollector 找不到 pred, KeyError: 'pred')
@@ -64,7 +76,7 @@ python3 run_rolling.py --skip-train --conf rolling_config_ndrop5.yaml --exp-name
 
 | 文件 | 说明 |
 |---|---|
-| `rolling_config.yaml` | 默认配置 (n_drop=5, topk=30) |
+| `rolling_config.yaml` | 默认生产配置 (n_drop=1, topk=30) |
 | `custom_handler.py` | 策略/处理器: VolatilityTimingStrategy, IndustryProcessor, Alpha158Industry, DvRatioProcessor, Alpha158DvRatio, IndustryCappedStrategy |
 | `run_rolling.py` | 滚动训练+回测入口, 注册所有 custom handler |
 | `dump_dv_ratio.py` | dvratio PIT 落库脚本 |
@@ -77,7 +89,7 @@ python3 run_rolling.py --skip-train --conf rolling_config_ndrop5.yaml --exp-name
 ## mlruns 关键实验
 
 - `rolling_csi300_lgbm` — 技术面 baseline (n_drop=1)
-- `rolling_csi300_lgbm_ndrop5` — **当前新 baseline** (n_drop=5)
+- `rolling_csi300_lgbm_ndrop1` — **当前 baseline** (n_drop=1, 净成本最优)
 - `rolling_models_*` — 各次滚动训练的 27 期模型
 
 ## 数据/环境备注
@@ -129,10 +141,34 @@ python3 run_rolling.py --skip-train --conf rolling_config_ndrop5.yaml --exp-name
 - **修复**: `backfill_missing.py` 断点续跑补齐 (分批 250-700 只/次, 因 baostock 长连接会被杀); 4604 只到 7-31
 - **附带修复**: `build_existing_last_values` 用 bin 实际最后行而非 calendar[-1]; first_adjclose 遇 NaN 取首个有效值
 
+### Bug 3: csi300.txt 陈旧导致回测实际只交易到 2026-04-17
+- **症状**: baseline"回测到 2026-07"实际只有效交易到 04-17; pred.pkl 只到 04-17, 7-31 尾巴是静态持仓估值
+- **根因**: csi300.txt 最后一段 2025-12-31→2026-04-18 (无 2026-06 段), 唯一更新机制是 CSI 官网 collector 且无自动化; 2026-04-20 起 `D.list_instruments('csi300')` 返回 0 只
+- **修复**: 收口 2025-12-31 段 (end→2026-06-29) + 新建 2026-06-30→2026-07-31 段 (baostock 当前 300 成分); 见下方"csi300.txt 维护机制"
+
 ### 运行注意
 - **baostock 长任务易被杀**: 单进程 >1 分钟会被环境终止, 无 traceback. 大批量下载必须分批 (每批 timeout 窗口内完成) 或用 BACKFILL_START/END chunk
 - **验证标准**: open/close 比值≈1; 除权日收益率对照; 与 baostock 前复权价连续
 - **已知无害异常**: 39 只 ST 股/新股上市首日/北交所 O/C 偏离 (历史遗留, 与 CSI300 无关)
+
+## csi300.txt 维护机制 (2026-08-01 起)
+
+### 半年调样规则
+- CSI300 每年 6/12 月**最后交易日**调样; csi300.txt 按调样期存段, 每段 [start, end] 各 300 只
+- 段边界惯例: 2024-06-28 / 2024-12-31 / 2025-06-30 / 2025-12-31 / **2026-06-30** ...
+
+### sync_csi300_instruments(end_date) — update_baostock.py
+- 每次运行 main 自动调用, 用 `bs.query_hs300_stocks()` 当前成分维护最后段落:
+  - 若自当前段 start 起已跨过调样日: 收口旧段 (end = 调样日前一交易日) + 新建 [调样日, end_date] 段 (用 baostock 当前 300 成分)
+  - 否则仅把当前段 end 延伸至 end_date
+- **解决了 csi300.txt 陈旧 bug**: 旧 csi300.txt 只到 2026-04-18 (无 2026-06 段), 导致 qlib 在 2026-04-20 起返回 0 只 → 回测实际只交易到 04-17 (pred.pkl 只到 04-17, 7-31 尾巴是静态持仓估值非真实交易)
+- 已修复: 收口 2025-12-31 段 (end→2026-06-29) + 新建 2026-06-30→2026-07-31 段; `D.list_instruments('csi300')` 2026-04~07 均返回 300 只
+
+### 新股流程 (sync_new_stocks + download_new_stocks)
+- `sync_new_stocks`: 纯发现 (query_all_stock - all.txt 差集), **不写 all.txt/csi300.txt**
+- **新股进 csi300.txt 只按实际调样日**: 由 sync_csi300_instruments 用 baostock 官方成分维护, 非 IPO 即进 → 避免 look-ahead (长鑫 688825 7-27 IPO, 流通市值 2430 亿, 但当前不在 HS300 → 12 月调样才可能进)
+- `download_new_stocks`: 下载新股 IPO→end 全历史, 直接换算进 qlib 坐标系 (新股无复权, `first_adjclose=首日close`, `factor=1/first_adjclose`, close 首日=1); 落 CSV 后由 DumpDataUpdate 的 **new-stock 分支** 全量建 bin + 自动注册 all.txt
+- 已验证: 19 只新股 (长鑫等) 落 bin 且 O/C≈1; all.txt +19 条
 
 ## 当前待办/可继续方向
 

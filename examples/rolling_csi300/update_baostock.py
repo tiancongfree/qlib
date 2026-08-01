@@ -6,6 +6,7 @@ import sys
 import time
 import tempfile
 import warnings
+import calendar as _cal
 from datetime import datetime, timedelta
 from pathlib import Path
 import numpy as np
@@ -16,6 +17,7 @@ from scripts.dump_bin import DumpDataUpdate
 QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
 LAST_UPDATE_FILE = Path(__file__).parent / ".last_update.txt"
 OVERLAP_DAYS = 5  # enough for ratio computation
+CSI300_MV_THRESHOLD = 500e8  # 500亿流通市值: 大概率进 CSI300 (当前成分股最小约212亿)
 
 def _latest_trading_day() -> datetime:
     """Return the most recent probable trading day (date only, time=midnight)."""
@@ -147,6 +149,323 @@ def download(stock_list, start, end):
         raise RuntimeError(f"No data downloaded ({fail} failures)")
     print(f"  Downloaded {len(all_data)} stocks, {fail} failures")
     return all_data
+
+def read_all_instruments():
+    """Read all.txt as {code_lower: (start, end)}."""
+    p = QLIB_DIR / "instruments" / "all.txt"
+    if not p.exists():
+        return {}
+    df = pd.read_csv(p, sep="\t", names=["s", "st", "en"], dtype=str)
+    return {row.s.strip().lower(): (row.st.strip(), row.en.strip()) for _, row in df.iterrows()}
+
+def estimate_float_mv(bs_sym: str, end_date: str) -> float | None:
+    """Estimate float market value (元) from baostock k-data.
+
+    Uses turn (换手率%) and volume (股) to back out float shares:
+        float_shares = volume / (turn/100)
+        float_mv = close * float_shares
+    Returns None if insufficient data.
+    """
+    start = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+    rs = bs.query_history_k_data_plus(
+        bs_sym, "date,close,volume,turn",
+        start_date=start, end_date=end_date, frequency="d", adjustflag="2",
+    )
+    if rs.error_code != "0":
+        return None
+    best = None
+    while rs.next():
+        r = rs.get_row_data()
+        try:
+            close = float(r[1]); vol = float(r[2]); turn = float(r[3])
+        except (ValueError, TypeError):
+            continue
+        if turn > 0 and vol > 0:
+            float_shares = vol / (turn / 100.0)
+            best = close * float_shares
+    return best
+
+def _last_trading_day(year: int, month: int, calendar) -> pd.Timestamp:
+    """Last trading day in a given (year, month) from qlib calendar.
+
+    Falls back to the nominal month-end day if that month is not in the
+    calendar yet (future month not downloaded).
+    """
+    sub = [d for d in calendar if d.year == year and d.month == month]
+    if sub:
+        return max(sub)
+    return pd.Timestamp(year, month, _cal.monthrange(year, month)[1])
+
+def _rebalance_dates_between(start, end, calendar):
+    """Last trading days of Jun/Dec strictly after start and <= end."""
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    by_ym = {}
+    for d in calendar:
+        if start_ts < d <= end_ts:
+            key = d.strftime("%Y-%m")
+            cur = by_ym.get(key)
+            if cur is None or d > cur:
+                by_ym[key] = d
+    return [d for k, d in sorted(by_ym.items()) if d.month in (6, 12)]
+
+def _trading_day_before(d, calendar):
+    """Trading day strictly before d, or None."""
+    cand = [x for x in calendar if x < pd.Timestamp(d)]
+    return cand[-1] if cand else None
+
+def _next_rebalance_date(end_date, calendar) -> pd.Timestamp:
+    """Next CSI300 rebalancing date (last trading day of Jun/Dec) after end_date."""
+    t = pd.Timestamp(end_date)
+    if t.month < 6:
+        return _last_trading_day(t.year, 6, calendar)
+    if t.month < 12:
+        return _last_trading_day(t.year, 12, calendar)
+    return _last_trading_day(t.year + 1, 6, calendar)
+
+def sync_csi300_instruments(end_date: str) -> bool:
+    """Maintain csi300.txt segments per CSI300 semi-annual rebalance rules.
+
+    CSI300 rebalances on the last trading day of June and December. The
+    universe file stores one segment per period: [segment_start, segment_end].
+
+    - If a rebalance date has passed since the current segment started: close
+      the old segment at the trading day before the rebalance, and open a new
+      segment [rebalance_date, end_date] using baostock's current constituent
+      list (query_hs300_stocks).
+    - Otherwise: just extend the current segment's end to end_date.
+    """
+    print("\n[0.6] Syncing csi300 constituents (semi-annual rebalance)...")
+    lg = bs.login()
+    if lg.error_code != "0":
+        print(f"  baostock login failed: {lg.error_msg}, skip")
+        return False
+    try:
+        return _sync_csi300_logged_in(end_date)
+    finally:
+        bs.logout()
+
+def _sync_csi300_logged_in(end_date: str) -> bool:
+    p = QLIB_DIR / "instruments" / "csi300.txt"
+    if not p.exists():
+        print(f"  {p.name} not found, skip")
+        return False
+    df = pd.read_csv(p, sep="\t", names=["s", "st", "en"], dtype=str)
+    df["s"] = df["s"].str.strip()
+    df["st"] = df["st"].str.strip()
+    df["en"] = df["en"].str.strip()
+    en_prev = df["en"].max()
+    cur_mask = df["en"] == en_prev
+    st_prev = df.loc[cur_mask, "st"].min()
+    cal = read_calendar()
+    print(f"  Current segment: {st_prev} -> {en_prev} ({int(cur_mask.sum())} stocks)")
+
+    rs = bs.query_hs300_stocks()
+    if rs.error_code != "0":
+        print(f"  query_hs300_stocks failed: {rs.error_msg}, skip")
+        return False
+    curr = set()
+    upd = None
+    while rs.next():
+        row = rs.get_row_data()
+        upd = upd or row[0]
+        curr.add(row[1].replace(".", "").upper())
+    print(f"  Baostock current HS300: {len(curr)} stocks (updateDate={upd})")
+
+    rebal = _rebalance_dates_between(st_prev, end_date, cal)
+    if not rebal:
+        if end_date > en_prev:
+            df.loc[cur_mask, "en"] = end_date
+            df.to_csv(p, sep="\t", header=False, index=False)
+            print(f"  No rebalance since {st_prev}; extended segment end to {end_date}")
+        else:
+            print(f"  Already up to date (end={en_prev})")
+        return True
+
+    r_first, r_last = rebal[0], rebal[-1]
+    prev_day = _trading_day_before(r_first, cal)
+    if prev_day is None:
+        print(f"  No trading day before rebalance {r_first.date()}, skip")
+        return False
+    prev_end = prev_day.strftime("%Y-%m-%d")
+    r_last_s = r_last.strftime("%Y-%m-%d")
+    # close old segment at the trading day before the first rebalance
+    df.loc[cur_mask, "en"] = prev_end
+    # drop any stale pre-registered lines that this new segment supersedes
+    df = df[df["st"] != r_last_s]
+    # append new segment with current constituents
+    new_rows = pd.DataFrame({"s": sorted(curr), "st": r_last_s, "en": end_date})
+    df = pd.concat([df, new_rows], ignore_index=True)
+    df = df.sort_values(["st", "s"]).reset_index(drop=True)
+    df.to_csv(p, sep="\t", header=False, index=False)
+    print(f"  Rebalance {r_first.date()}: closed old segment at {prev_end}")
+    print(f"  New segment {r_last_s} -> {end_date}: {len(curr)} stocks")
+    return True
+
+def sync_new_stocks(end_date: str):
+    """Discover newly-listed stocks (IPO discovery only).
+
+    Pulls the full trading universe via bs.query_all_stock and returns the
+    stocks missing from all.txt. Registration of the bins + all.txt entry is
+    done by DumpDataUpdate's native "new stock" branch during dump_update
+    (it full-dumps from the CSVs and saves all.txt). This avoids pre-registering
+    codes that have no bins yet.
+
+    Returns list of dicts: {fname, bs_sym, start_dt, mv}.
+    """
+    print("\n[0.5] Syncing new stocks (IPO discovery)...")
+    lg = bs.login()
+    if lg.error_code != "0":
+        print(f"  baostock login failed: {lg.error_msg}, skip")
+        return []
+    try:
+        return _sync_new_stocks_logged_in(end_date)
+    finally:
+        bs.logout()
+
+def _sync_new_stocks_logged_in(end_date: str):
+    rs = bs.query_all_stock(day=end_date)
+    if rs.error_code != "0":
+        print(f"  query_all_stock failed: {rs.error_msg}, skip")
+        return []
+    live = []
+    while rs.next():
+        row = rs.get_row_data()
+        code, status, name = row[0], row[1], row[2]
+        # keep A-shares only (sh/sz). Exclude indices: sh.000xxx, sz.399xxx.
+        if status != "1":
+            continue
+        sym = code.lower()
+        if sym.startswith("sz.399"):
+            continue
+        if sym.startswith(("sh.6", "sh.688", "sz.0", "sz.3")):
+            live.append(sym)
+    live = sorted(set(live))
+    all_inst = read_all_instruments()
+
+    new_codes = [s for s in live if s.replace(".", "").lower() not in all_inst]
+    print(f"  Live A-shares: {len(live)}, already in all.txt: {len(live) - len(new_codes)}, new: {len(new_codes)}")
+    if not new_codes:
+        print("  No new stocks.")
+        return []
+
+    results = []
+    for i, bs_sym in enumerate(new_codes):
+        fname = bs_sym.replace(".", "").lower()
+        # estimate float MV (informational; csi300 membership is handled by
+        # sync_csi300_instruments using baostock's official HS300 list)
+        mv = estimate_float_mv(bs_sym, end_date)
+        start_dt = None
+        # find IPO date via query_stock_basic
+        try:
+            rb = bs.query_stock_basic(code=bs_sym)
+            if rb.error_code == "0" and rb.next():
+                start_dt = rb.get_row_data()[2]  # ipoDate
+        except Exception:
+            pass
+        if not start_dt:
+            start_dt = end_date
+        results.append({"fname": fname, "bs_sym": bs_sym, "start_dt": start_dt, "mv": mv})
+        if i % 20 == 0 or i == len(new_codes) - 1:
+            print(f"  [{i+1}/{len(new_codes)}] {fname}: mv={mv/1e8:.0f}亿" if mv else f"  [{i+1}/{len(new_codes)}] {fname}: mv=N/A")
+
+    print(f"  Discovered {len(results)} new stocks (bins registered by DumpDataUpdate)")
+    return results
+
+def _bs_query_rows(bs_sym, start_date, end_date):
+    """Query one stock's k-data, re-logging in once if the session died.
+
+    baostock long-lived sessions get killed in this environment (Bad file
+    descriptor / 接收数据异常), so a single retry with a fresh login covers it.
+    """
+    def _query():
+        return bs.query_history_k_data_plus(
+            bs_sym,
+            "date,open,high,low,close,volume,amount,pctChg",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2",
+        )
+    rs = _query()
+    if rs.error_code != "0":
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        lg = bs.login()
+        if lg.error_code != "0":
+            return rs
+        rs = _query()
+    return rs
+
+def download_new_stocks(new_stocks, end_date: str):
+    """Download full history (IPO -> end_date) for newly-listed stocks.
+
+    New stocks have no existing bins so map_and_scale can't be used; we fetch
+    the whole history and map it into qlib coordinates directly (a fresh IPO has
+    no corporate actions yet, so forward-adjusted close == raw close).
+    Returns a DataFrame with the same schema as map_and_scale output.
+    """
+    rows_out = []
+    lg = bs.login()
+    if lg.error_code != "0":
+        print(f"  baostock login failed: {lg.error_msg}, skip new-stock download")
+        return pd.DataFrame()
+    try:
+        for info in new_stocks:
+            bs_sym, start_dt = info["bs_sym"], info["start_dt"]
+            try:
+                rs = _bs_query_rows(bs_sym, start_dt, end_date)
+                if rs.error_code != "0":
+                    print(f"    {info['fname']}: query failed ({rs.error_msg}), skip")
+                    continue
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    print(f"    {info['fname']}: empty, skip")
+                    continue
+                df = pd.DataFrame(rows, columns=rs.fields)
+                for col in ["open", "high", "low", "close", "volume", "amount", "pctChg"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["close"]).sort_values("date")
+                if df.empty or (df["close"] <= 0).all():
+                    print(f"    {info['fname']}: no valid close, skip")
+                    continue
+                first_adjclose = df["close"].iloc[0]
+                for _, row in df.iterrows():
+                    adjclose = row["close"]
+                    close_val = adjclose / first_adjclose
+                    fac = 1.0 / first_adjclose
+                    vol_val = row["volume"] if pd.notna(row["volume"]) and row["volume"] > 0 else 0
+                    amt_val = row["amount"] if pd.notna(row["amount"]) and row["amount"] > 0 else 0
+                    rows_out.append({
+                        "symbol": info["fname"].lower(),
+                        "date": pd.to_datetime(row["date"]),
+                        "open": row["open"] * fac if pd.notna(row["open"]) else np.nan,
+                        "high": row["high"] * fac if pd.notna(row["high"]) else np.nan,
+                        "low": row["low"] * fac if pd.notna(row["low"]) else np.nan,
+                        "close": close_val,
+                        "volume": vol_val,
+                        "amount": amt_val,
+                        "adjclose": adjclose,
+                        "factor": fac,
+                        "change": (row["pctChg"] / 100.0) if pd.notna(row["pctChg"]) else 0,
+                        "vwap": (amt_val / vol_val) if vol_val > 0 else close_val,
+                    })
+                print(f"    {info['fname']}: {len(df)} rows (IPO {start_dt})")
+            except Exception as exc:
+                print(f"    {info['fname']}: ERROR {exc}, skip")
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+    result = pd.DataFrame(rows_out)
+    if not result.empty:
+        result = result.dropna(subset=["date", "close"])
+    return result
+
 def map_and_scale(all_dfs, existing, calendar):
     """Map baostock data to qlib format using per-stock empirical ratios."""
     combined = pd.concat(all_dfs, ignore_index=True)
@@ -245,11 +564,10 @@ def main():
     end = _latest_trading_day()
     start = calendar[-1] - timedelta(days=OVERLAP_DAYS)
 
-    # Quick check: if no new trading day, skip entirely
-    if end.date() <= calendar[-1].date():
-        print(f"  Already up to date (calendar: {calendar[-1].date()}, target: {end.date()})")
-        _write_last_update(end)
-        return
+    # Discover newly-listed stocks BEFORE the early-exit check
+    new_stocks = sync_new_stocks(end.strftime("%Y-%m-%d"))
+    # Maintain csi300 segments (semi-annual rebalance) BEFORE the early-exit check
+    sync_csi300_instruments(end.strftime("%Y-%m-%d"))
 
     # If last update was long ago, use full overlap for accurate ratio
     last_upd = _read_last_update()
@@ -259,33 +577,49 @@ def main():
         print("  Large gap since last update, using full 35-day overlap")
     else:
         print(f"  Last update: {last_upd.date()}")
+
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
-    print(f"  Download range: {start_str} -> {end_str}")
+    has_new_day = end.date() > calendar[-1].date()
+    print(f"  Download range: {start_str} -> {end_str} (new trading day: {has_new_day})")
 
-    inst = pd.read_csv(QLIB_DIR / "instruments/all.txt", sep="\t", names=["s", "st", "en"])
-    stock_list = inst["s"].str.strip().str.lower().tolist()
-    print(f"  {len(stock_list)} instruments")
-    print("  Reading last bin values...")
-    existing = build_existing_last_values(stock_list, calendar)
-    print(f"  Got last values for {len(existing)} stocks")
-    # 2. Download
-    print(f"\n[2] Downloading baostock data ({start_str} -> {end_str})...")
-    all_dfs = download(stock_list, start_str, end_str)
-    # 3. Map & scale
-    print("\n[3] Mapping and scaling...")
-    result_df = map_and_scale(all_dfs, existing, calendar)
-    print(f"  Total rows: {len(result_df)}")
-    print(f"  Stocks: {result_df['symbol'].nunique()}")
-    if not result_df.empty:
-        print(f"  Date range: {result_df['date'].min().date()} -> {result_df['date'].max().date()}")
-    # 4. Filter new dates only
-    new_data = result_df[result_df["date"] > calendar[-1]]
-    print(f"  New rows (after {calendar[-1].date()}): {len(new_data)}")
-    if not new_data.empty:
-        print(f"  New dates: {sorted(new_data['date'].unique())[:5]} ...")
-    if new_data.empty:
-        print("No new data. Already up to date!")
+    # Existing-stock incremental update (overlap + new dates)
+    new_data = pd.DataFrame()
+    if has_new_day:
+        inst = pd.read_csv(QLIB_DIR / "instruments/all.txt", sep="\t", names=["s", "st", "en"])
+        stock_list = inst["s"].str.strip().str.lower().tolist()
+        print(f"  {len(stock_list)} instruments")
+        print("  Reading last bin values...")
+        existing = build_existing_last_values(stock_list, calendar)
+        print(f"  Got last values for {len(existing)} stocks")
+        # 2. Download
+        print(f"\n[2] Downloading baostock data ({start_str} -> {end_str})...")
+        all_dfs = download(stock_list, start_str, end_str)
+        # 3. Map & scale
+        print("\n[3] Mapping and scaling...")
+        result_df = map_and_scale(all_dfs, existing, calendar)
+        print(f"  Total rows: {len(result_df)}")
+        print(f"  Stocks: {result_df['symbol'].nunique()}")
+        if not result_df.empty:
+            print(f"  Date range: {result_df['date'].min().date()} -> {result_df['date'].max().date()}")
+        new_data = result_df[result_df["date"] > calendar[-1]]
+        print(f"  New rows (after {calendar[-1].date()}): {len(new_data)}")
+        if not new_data.empty:
+            print(f"  New dates: {sorted(new_data['date'].unique())[:5]} ...")
+    else:
+        print(f"  No new trading day (calendar: {calendar[-1].date()}), only processing new stocks")
+
+    # New-stock full history (IPO -> end) mapped into qlib coordinates
+    new_stock_data = pd.DataFrame()
+    if new_stocks:
+        print(f"\n[3b] Downloading full history for {len(new_stocks)} new stocks...")
+        new_stock_data = download_new_stocks(new_stocks, end_str)
+        if not new_stock_data.empty:
+            print(f"  New-stock rows: {len(new_stock_data)}, stocks: {new_stock_data['symbol'].nunique()}")
+
+    all_new = pd.concat([new_data, new_stock_data], ignore_index=True)
+    if all_new.empty:
+        print("No new data and no new stocks. Already up to date!")
         _write_last_update(end)
         print(f"  Last update record saved: {end.strftime('%Y-%m-%d')}")
         return
@@ -294,7 +628,7 @@ def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="qlib_upd_"))
     csv_dir = tmpdir / "csv"
     csv_dir.mkdir(parents=True)
-    for fname, grp in new_data.groupby("symbol"):
+    for fname, grp in all_new.groupby("symbol"):
         fpath = csv_dir / f"{fname}.csv"
         grp.to_csv(fpath, index=False)
     n_files = len(list(csv_dir.glob("*.csv")))
