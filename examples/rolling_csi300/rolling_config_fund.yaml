@@ -21,7 +21,7 @@ port_analysis_config: &id002
   strategy:
     class: TopkDropoutStrategy
     kwargs:
-      n_drop: 5
+      n_drop: 1
       signal: <PRED>
       topk: 30
     module_path: qlib.contrib.strategy
@@ -33,7 +33,7 @@ task:
     class: DatasetH
     kwargs:
       handler:
-        class: Alpha158Industry
+        class: Alpha158Fundamental
         kwargs: *id001
         module_path: custom_handler
       segments:

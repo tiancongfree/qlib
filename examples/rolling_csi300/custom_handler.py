@@ -217,6 +217,109 @@ class Alpha158Industry(Alpha158):
         return fields, names
 
 
+class DvRatioProcessor(Processor):
+    """Robust preprocessing for 分红融资比 (dividend/financing ratio) features.
+
+    The raw ratio is heavily right-skewed and undefined (NaN) for stocks with no
+    equity financing. We:
+      1) fill NaN with 0 (separates "no financing" from "low ratio");
+      2) winsorize extreme values cross-sectionally (per-date 1%/99% clip);
+      3) add a cross-sectional rank version CSR_ (scale-free, robust to skew).
+    """
+
+    DV_FEATURES = ("DV_RATIO", "DV_RATIO_ALL", "DV_RATIO_YOY", "DV_RATIO_ALL_YOY")
+
+    def __init__(self, winsor_quantile: float = 0.01):
+        self.winsor_quantile = winsor_quantile
+        self._fit_done = False
+
+    def fit(self, df=None):
+        self._fit_done = True
+
+    def __call__(self, df):
+        if not self._fit_done:
+            self.fit(df)
+
+        is_multi = isinstance(df.columns, pd.MultiIndex)
+        dts = df.index.get_level_values(0)
+
+        def winsor(s):
+            lo, hi = s.quantile(self.winsor_quantile), s.quantile(1 - self.winsor_quantile)
+            return s.clip(lo, hi)
+
+        new_cols = {}
+        for col in df.columns:
+            col_name = col[1] if is_multi else col
+            if not any(col_name.startswith(k) for k in self.DV_FEATURES):
+                continue
+            s = pd.Series(df[col].values, index=dts)
+            # 1) NaN -> 0 (no financing = 0 financing, keep as a distinct value)
+            s = s.fillna(0.0)
+            # 2) cross-sectional winsorize (per date)
+            wins = s.groupby(level=0).transform(winsor)
+            if is_multi:
+                df[col] = wins.values
+            else:
+                df[col] = wins.values
+            # 3) cross-sectional rank version (approx unit-normalized)
+            csr = wins.groupby(level=0).rank(pct=True)
+            csr = (csr - 0.5) * 3.46
+            new_cols[(f"CSR_{col_name}")] = csr.values
+
+        if new_cols:
+            extra = pd.DataFrame(new_cols, index=df.index)
+            if is_multi:
+                extra.columns = pd.MultiIndex.from_tuples([("feature", c) for c in extra.columns])
+            df = pd.concat([df, extra], axis=1)
+
+        return df
+
+    def readonly(self):
+        return False
+
+
+class Alpha158DvRatio(Alpha158Industry):
+    """Alpha158Industry + 分红融资比 (dividend/financing ratio) features.
+
+    DvRatio features (no lookahead):
+        use_daily=True:   $dv_ratio, $dv_ratio_all (precomputed daily bins, ffill
+                          from announcement dates -> ~4x faster rolling build)
+        use_daily=False:  P($$dv_ratio_q), P($$dv_ratio_all_q) (PIT quarterly)
+        + YoY reference 4 quarters ago in both cases.
+    """
+
+    def __init__(self, use_daily: bool = True, *args, **kwargs):
+        self.use_daily = use_daily
+        processor = {"class": "DvRatioProcessor", "module_path": "custom_handler"}
+        shared = list(kwargs.pop("shared_processors", []))
+        shared.append(processor)
+        kwargs["shared_processors"] = shared
+        super().__init__(*args, **kwargs)
+
+    def get_feature_config(self):
+        fields, names = super().get_feature_config()
+
+        if self.use_daily:
+            dv_fields = [
+                ("$dv_ratio", "DV_RATIO"),
+                ("$dv_ratio_all", "DV_RATIO_ALL"),
+                ("Ref($dv_ratio, 60)", "DV_RATIO_YOY"),
+                ("Ref($dv_ratio_all, 60)", "DV_RATIO_ALL_YOY"),
+            ]
+        else:
+            dv_fields = [
+                ("P($$dv_ratio_q)", "DV_RATIO"),
+                ("P($$dv_ratio_all_q)", "DV_RATIO_ALL"),
+                ("P(Ref($$dv_ratio_q, 4))", "DV_RATIO_YOY"),
+                ("P(Ref($$dv_ratio_all_q, 4))", "DV_RATIO_ALL_YOY"),
+            ]
+        for expr, name in dv_fields:
+            fields += [expr]
+            names += [name]
+
+        return fields, names
+
+
 class IndustryCappedStrategy(TopkDropoutStrategy):
     """TopK with gradual industry cap — phases out excess gradually to limit turnover."""
 
@@ -317,3 +420,5 @@ class IndustryCappedStrategy(TopkDropoutStrategy):
             )
             buy_order_list.append(buy_order)
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+

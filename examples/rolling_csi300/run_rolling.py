@@ -32,6 +32,8 @@ from save_positions import save_positions_to_csv
 add_safe_class("custom_handler", "Alpha158Momentum")
 add_safe_class("custom_handler", "Alpha158Industry")
 add_safe_class("custom_handler", "IndustryProcessor")
+add_safe_class("custom_handler", "DvRatioProcessor")
+add_safe_class("custom_handler", "Alpha158DvRatio")
 add_safe_class("custom_handler", "VolatilityTimingStrategy")
 add_safe_class("custom_handler", "IndustryCappedStrategy")
 

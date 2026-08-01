@@ -46,8 +46,11 @@ def fname_to_bs(fname: str) -> str:
 def bs_to_fname(bs_sym: str) -> str:
     return bs_sym.replace(".", "").lower()
 def build_existing_last_values(stock_list, calendar):
-    """For each stock, read last adjclose, close, factor, volume, amount from bin."""
-    last_cal_idx = len(calendar) - 1
+    """For each stock, read last adjclose, close, factor, volume, amount from bin.
+
+    Uses each bin's actual last valid row (not calendar[-1]), because some bins
+    may lag behind the calendar if a previous update was interrupted.
+    """
     results = {}
     for fname in stock_list:
         feat_dir = QLIB_DIR / "features" / fname.lower()
@@ -59,14 +62,28 @@ def build_existing_last_values(stock_list, calendar):
         factor = np.fromfile(str(feat_dir / "factor.day.bin"), dtype='<f')
         volume = np.fromfile(str(feat_dir / "volume.day.bin"), dtype='<f')
         amount = np.fromfile(str(feat_dir / "amount.day.bin"), dtype='<f')
-        bin_start = int(adj[0])
-        bin_idx = last_cal_idx - bin_start + 1
-        if bin_idx < 1 or bin_idx >= len(adj):
+        if len(adj) < 3 or len(close) != len(adj):
             continue
+        bin_start = int(adj[0])
+        bin_idx = len(adj) - 1  # actual last row of this bin
+        if bin_idx < 1:
+            continue
+        # The last row may be a suspension-filled row; step back to find a valid close
+        last_adjclose = adj[bin_idx]
+        last_close = close[bin_idx]
+        while bin_idx > 1 and (not np.isfinite(last_adjclose) or last_adjclose <= 0):
+            bin_idx -= 1
+            last_adjclose = adj[bin_idx]
+            last_close = close[bin_idx]
+        # first_adjclose = first valid (finite, >0) adjclose after header
+        fa = adj[1]
+        if not (np.isfinite(fa) and fa > 0):
+            valid = np.where(np.isfinite(adj[1:]) & (adj[1:] > 0))[0]
+            fa = adj[1 + valid[0]] if len(valid) else np.nan
         results[fname] = {
-            "first_adjclose": adj[1],
-            "last_adjclose": adj[bin_idx],
-            "last_close": close[bin_idx],
+            "first_adjclose": fa,
+            "last_adjclose": last_adjclose,
+            "last_close": last_close,
             "last_factor": factor[bin_idx],
             "last_volume": volume[bin_idx],
             "last_amount": amount[bin_idx],
@@ -173,10 +190,13 @@ def map_and_scale(all_dfs, existing, calendar):
             if pd.isna(adjclose) or adjclose <= 0:
                 continue
             close_val = adjclose / first_adjclose
-            # Scale all forward-adjusted prices
-            open_val = row["open"] * adj_ratio if pd.notna(row["open"]) else np.nan
-            high_val = row["high"] * adj_ratio if pd.notna(row["high"]) else np.nan
-            low_val = row["low"] * adj_ratio if pd.notna(row["low"]) else np.nan
+            # Scale all forward-adjusted prices to the same (forward-adjusted) basis.
+            # open/high/low must be scaled identically to close (they were previously
+            # only multiplied by adj_ratio, producing a ~first_adjclose mismatch).
+            adj_fac = adj_ratio / first_adjclose
+            open_val = row["open"] * adj_fac if pd.notna(row["open"]) else np.nan
+            high_val = row["high"] * adj_fac if pd.notna(row["high"]) else np.nan
+            low_val = row["low"] * adj_fac if pd.notna(row["low"]) else np.nan
             # Volume and amount: apply empirical ratios directly
             vol = row["volume"]
             vol_val = vol * vol_ratio if pd.notna(vol) and vol > 0 else 0
