@@ -184,10 +184,11 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 |---|---|---|
 | `close` | 前复权, 以**上市首日=1** 归一 | 24.75 |
 | `adjclose` | 后复权价 (累积分红调整) | 263.88 |
-| `factor` | 复权系数, **真实价 = close/factor** | 0.608 |
+| `factor` | 复权系数 (⚠️ **不可靠, 见 Bug 4**, 勿用于价格换算) | 0.608 |
 
 - 恒等式: `close = adjclose / first_adjclose` (first_adjclose = 该股 bin 首日 adjclose, 恒定)
-- 同一天真实价: qlib `close/factor` ≈ baostock 前复权价 (相差一个恒定比例)
+- **关键**: `amount × close` (前复权市值) = **真实市值, 完全自洽正确**; 真实股数 = `市值 / 市场真实价 (baostock adjustflag=2)`
+- ⚠️ **`close/factor` 不是可靠真实价** — factor 存在系统性复权错误 (见 Bug 4)
 
 ### baostock 增量更新的坐标系转换
 - baostock (adjustflag=2) 前复权到**最新交易日**; qlib close 前复权到**上市首日** → 两套基准差一个**恒定比例**
@@ -216,6 +217,14 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **症状**: baseline"回测到 2026-07"实际只有效交易到 04-17; pred.pkl 只到 04-17, 7-31 尾巴是静态持仓估值
 - **根因**: csi300.txt 最后一段 2025-12-31→2026-04-18 (无 2026-06 段), 唯一更新机制是 CSI 官网 collector 且无自动化; 2026-04-20 起 `D.list_instruments('csi300')` 返回 0 只
 - **修复**: 收口 2025-12-31 段 (end→2026-06-29) + 新建 2026-06-30→2026-07-31 段 (baostock 当前 300 成分); 见下方"csi300.txt 维护机制"
+
+### Bug 4: factor 复权系数系统性错误 (2026-08-02 发现, 重要!)
+- **症状**: 300 只 CSI300 中 163 只 (54%) 的 `close/factor` 与 baostock 真实价偏差>3%, 63 只>12% (新易盛 -98%, 天孚 -160%, 三环集团 -27%)
+- **根因**: `update_baostock.py` map_and_scale 的 `factor_val = exist["last_factor"]` 增量更新时**沿用旧 factor 不重算** (line 533); 历史某次初始化复权基准错误后被永久固化
+- **关键澄清**: ① **qlib 日收益率完全正确** (相关系数 1.0000, 平均绝对差 0) → **所有回测结论不受影响** (收益是相对量); ② **`amount × close` = 真实市值自洽正确**; ③ 只有 **factor 不可靠**
+- **正确换算**: 真实市值 = `amount × close`; 真实股数 = `市值 / baostock真实价 (adjustflag=2)`
+- **sync_to_realtime.py 已修复**: 原用 `amount × factor` 算股数 → 改为 `amount × close / baostock真实价`; 对 factor 错误的股票 (紫金/三环等) 挂单数量修正
+- **未根治**: qlib factor 本身仍错, 但**不影响回测与 sync** (都已绕过 factor); 彻底修复需重建历史 bin 的 factor, 低优先级
 
 ### 运行注意
 - **baostock 长任务易被杀**: 单进程 >1 分钟会被环境终止, 无 traceback. 大批量下载必须分批 (每批 timeout 窗口内完成) 或用 BACKFILL_START/END chunk

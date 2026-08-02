@@ -156,10 +156,13 @@ def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
     instruments = [idx[0] for idx in target.index]
     real_prices = _load_real_prices(instruments)
 
-    # Convert qlib adjusted (前复权) amounts to real shares & real market value.
-    # qlib stores amount in adjusted shares and price in adjusted price:
-    #   real_shares = amount * factor
-    #   real_value  = real_shares * real_price
+    # Convert qlib target positions to real shares.
+    # qlib stores amount in adjusted (前复权) shares and price in adjusted price.
+    # The MARKET VALUE is exact and self-consistent:  value = amount * price.
+    #   real_shares = value / real_market_price
+    # Do NOT use factor here: qlib's factor is unreliable (systematically off by
+    # up to 100%+ for some stocks due to historical adjustment bugs), so
+    # amount*factor*real_price double-counts the error.
     items = []
     for idx, row in target.iterrows():
         instrument = idx[0]
@@ -169,15 +172,17 @@ def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
         real_price = real_prices.get(instrument)
         if not real_price or real_price <= 0:
             continue
-        factor = _load_factor(instrument)
-        real_shares = amount * factor if factor and factor > 0 else amount
-        real_value = real_shares * real_price
-        items.append((instrument, real_shares, real_value))
+        qlib_price = row.get("price")
+        if not qlib_price or qlib_price <= 0:
+            continue
+        value = amount * qlib_price  # real market value (adjusted basis is exact)
+        real_shares = value / real_price
+        items.append((instrument, real_shares, value))
 
-    total_real_value = sum(v for _, _, v in items)
-    scale = max_total / total_real_value if (max_total and total_real_value) else 1.0
+    total_value = sum(v for _, _, v in items)
+    scale = max_total / total_value if (max_total and total_value) else 1.0
 
-    for instrument, real_shares, real_value in items:
+    for instrument, real_shares, value in items:
         scaled_shares = real_shares * scale
         qty = _to_lots(scaled_shares)
         if qty > 0:
