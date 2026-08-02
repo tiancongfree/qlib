@@ -163,7 +163,7 @@ $equityCurveCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath analy
 Write-Log "Running: $($wslCmd -replace [regex]::Escape($ApiKey), '****')"
 
 $exitCode = 0
-wsl -e bash -c $wslCmd 2>&1 | ForEach-Object {
+wsl -u tc bash -c $wslCmd 2>&1 | ForEach-Object {
     $line = $_ -replace "`r", ""
     if ($line -match '__EXIT__(\d+)') {
         $exitCode = [int]$Matches[1]
@@ -178,7 +178,7 @@ if ($exitCode -eq 0) {
     # Run IC decay analysis; the visualization plot is saved to:
     #   /home/tc/qlib/examples/rolling_csi300/ic_decay_quarterly_rolling_csi300_lgbm.png
     Write-Log "Running IC decay analysis..."
-    wsl -e bash -c $icDecayCmd 2>&1 | ForEach-Object {
+    wsl -u tc bash -c $icDecayCmd 2>&1 | ForEach-Object {
         $line = $_ -replace "`r", ""
         if ($line -match '__EXIT__(\d+)') {
             Write-Log "IC decay analysis exit code: $([int]$Matches[1])"
@@ -190,7 +190,7 @@ if ($exitCode -eq 0) {
     # Run equity curve analysis; the interactive HTML is saved to:
     #   /home/tc/qlib/examples/rolling_csi300/equity_curve_rolling_csi300_lgbm.html
     Write-Log "Running equity curve analysis..."
-    wsl -e bash -c $equityCurveCmd 2>&1 | ForEach-Object {
+    wsl -u tc bash -c $equityCurveCmd 2>&1 | ForEach-Object {
         $line = $_ -replace "`r", ""
         if ($line -match '__EXIT__(\d+)') {
             Write-Log "Equity curve analysis exit code: $([int]$Matches[1])"
@@ -205,7 +205,7 @@ if ($exitCode -eq 0) {
     if ($restarted) {
         Write-Log "  Retrying sync after restart..."
         $exitCode = 0
-        wsl -e bash -c $wslCmd 2>&1 | ForEach-Object {
+        wsl -u tc bash -c $wslCmd 2>&1 | ForEach-Object {
             $line = $_ -replace "`r", ""
             if ($line -match '__EXIT__(\d+)') {
                 $exitCode = [int]$Matches[1]
@@ -219,7 +219,7 @@ if ($exitCode -eq 0) {
             # Run IC decay analysis; the visualization plot is saved to:
             #   /home/tc/qlib/examples/rolling_csi300/ic_decay_quarterly_rolling_csi300_lgbm.png
             Write-Log "Running IC decay analysis..."
-            wsl -e bash -c $icDecayCmd 2>&1 | ForEach-Object {
+            wsl -u tc bash -c $icDecayCmd 2>&1 | ForEach-Object {
                 $line = $_ -replace "`r", ""
                 if ($line -match '__EXIT__(\d+)') {
                     Write-Log "IC decay analysis exit code: $([int]$Matches[1])"
@@ -231,7 +231,7 @@ if ($exitCode -eq 0) {
             # Run equity curve analysis; the interactive HTML is saved to:
             #   /home/tc/qlib/examples/rolling_csi300/equity_curve_rolling_csi300_lgbm.html
             Write-Log "Running equity curve analysis..."
-            wsl -e bash -c $equityCurveCmd 2>&1 | ForEach-Object {
+            wsl -u tc bash -c $equityCurveCmd 2>&1 | ForEach-Object {
                 $line = $_ -replace "`r", ""
                 if ($line -match '__EXIT__(\d+)') {
                     Write-Log "Equity curve analysis exit code: $([int]$Matches[1])"
