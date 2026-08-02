@@ -4,11 +4,11 @@
 
 ## 策略概况
 
-- **策略**: rolling 滚动重训 + LightGBM(Alpha158Industry) + TopkDropoutStrategy, CSI300 内选股
+- **策略**: rolling 滚动重训 + LightGBM(Alpha158Industry) + ICTimingStrategy, CSI300 内选股
 - **市场**: CSI300, 回测区间 2020-01~2026-07
-- **基准配置**: `rolling_config.yaml` (已固化 **n_drop=1**, topk=30)
+- **基准配置**: `rolling_config.yaml` (已固化 **n_drop=1**, topk=30, ICTiming 动态降仓)
 - **当前 baseline**: `rolling_csi300_lgbm_ndrop1` (mlruns 实验)
-- **关键指标** (n_drop=1, 2020-2026, 净成本): 年化超额 ~17.1%, IR 1.29, 最大回撤 -19.8%, 换手 16/yr
+- **关键指标** (n_drop=1 + ICTiming, 2020-2026, 净成本): 年化超额 ~17.9%, IR 1.44, 最大回撤 -18.4%, 换手 16/yr
 
 ## 核心研究结论
 
@@ -103,6 +103,14 @@
 - **成本不变**: 各档总成本均 ~10.3-10.6%, min_cost 影响在 50w 也可忽略 (单笔仍远高于 2k)
 - **实盘启示**: 策略资金规模甜点在 **50-100w**; 1000w 收益反而下滑 ~4pp; 无需为"资金大"而加仓
 
+### 8. IC 动态降仓 (ICTimingStrategy) → 已纳入生产
+- **策略**: 基于滚动 RankIC (前瞻20天收益, 正确口径) 动态调仓; IC 低谷 (滚动60日 < ic_low=0.04) 时降 risk_degree 到 0.5, 恢复 (ic_high=0.06) 回满仓 0.95
+- **无未来函数 (关键修复)**: 初版用 `pct_change(20)` (回顾收益) 算 IC, 方向错误导致降仓信号无意义; 修复为**前瞻20天收益** (`close[t+20]/close[t]-1`) + **20交易日因果滞后** (`shift(20)`, 决策时只用已完全实现的IC)
+- **样本外验证 (2020-2024定阈值 → 2025-2026检验)**: 样本外年化 +0.8pp (29.17% vs 28.35%), 超额 +0.8pp, **回撤 -13.7%→-9.3% (改善4.4pp)**; 训练段也改善 → 非过拟合
+- **全量回测 (生产配置)**: 净年化 17.87% vs 原始 17.12% (+0.8pp), 净IR 1.44 vs 1.29, 回撤 -18.4% vs -19.8%; 换手/成本不变 (纯降仓防守)
+- **教训**: 任何动态策略必须检查①IC收益方向 (前瞻 vs 回顾) ②因果滞后 (用未来窗口数据必须 shift); 否则"看似有效"是伪信号
+- **注意**: 样本外仅1.5年, 实盘需持续监控 IC; 若 IC 长期失效 (如连续1年 <0.03) 应暂停策略而非仅降仓
+
 ## 运行方式
 
 ```bash
@@ -121,8 +129,9 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 
 | 文件 | 说明 |
 |---|---|
-| `rolling_config.yaml` | 默认生产配置 (n_drop=1, topk=30) |
-| `custom_handler.py` | 策略/处理器: VolatilityTimingStrategy, IndustryProcessor, Alpha158Industry, DvRatioProcessor, Alpha158DvRatio, IndustryCappedStrategy |
+| `rolling_config.yaml` | 默认生产配置 (n_drop=1, topk=30, ICTiming 动态降仓) |
+| `rolling_config_ictiming.yaml` | ICTiming 策略专用配置 (ic_low=0.04, low_risk=0.5) |
+| `custom_handler.py` | 策略/处理器: VolatilityTimingStrategy, ICTimingStrategy, MinTradeValueStrategy, IndustryProcessor, Alpha158Industry, DvRatioProcessor, Alpha158DvRatio, IndustryCappedStrategy |
 | `run_rolling.py` | 滚动训练+回测入口, 注册所有 custom handler |
 | `dump_dv_ratio.py` | dvratio PIT 落库脚本 |
 | `dump_dv_ratio_daily.py` | PIT→日频 bin 提速脚本 |
@@ -134,7 +143,8 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 ## mlruns 关键实验
 
 - `rolling_csi300_lgbm` — 技术面 baseline (n_drop=1)
-- `rolling_csi300_lgbm_ndrop1` — **当前 baseline** (n_drop=1, 净成本最优)
+- `rolling_csi300_lgbm_ndrop1` — **当前 baseline** (n_drop=1 + ICTiming, 净成本最优)
+- `rolling_csi300_lgbm_ictiming` — ICTiming 策略专项实验
 - `rolling_models_*` — 各次滚动训练的 27 期模型
 
 ## 数据/环境备注
@@ -217,6 +227,6 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 
 ## 当前待办/可继续方向
 
-- (可选) IC 低谷期防御 (动态降仓) — 理论可行, 未验证
+- (可选) IC 长期失效监控与自动暂停机制 — 已在 ICTiming 内降仓, 极端情况需暂停
 - (可选) 更高频/另类信号源 (分钟级) — 机构暴力来源, 需新数据
 - (可选) 减少训练窗口减轻 swap 依赖

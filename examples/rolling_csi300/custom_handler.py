@@ -107,6 +107,104 @@ class VolatilityTimingStrategy(TopkDropoutStrategy):
         return super().generate_trade_decision(execute_result)
 
 
+class ICTimingStrategy(TopkDropoutStrategy):
+    """TopkDropoutStrategy with dynamic position sizing based on trailing RankIC.
+
+    Uses the realized RankIC over the trailing ``ic_window`` trading days to
+    detect factor decay / crowded-alpha periods.  When the trailing IC is weak
+    (below ``ic_low``), the strategy reduces ``risk_degree`` (de-risk).  When IC
+    recovers above ``ic_high``, it returns to the full ``risk_degree``.
+
+    Parameters
+    ----------
+    ic_window : int
+        Trailing window (trading days) used to compute realized RankIC.
+    ic_low : float
+        RankIC below which the strategy de-risks (lower risk_degree).
+    ic_high : float
+        RankIC above which the strategy restores full risk_degree.
+    low_risk : float
+        risk_degree used when de-risking.
+    """
+
+    def __init__(
+        self,
+        *,
+        ic_window=60,
+        ic_low=0.03,
+        ic_high=0.05,
+        low_risk=0.4,
+        **kwargs,
+    ):
+        self.risk_degree = kwargs.pop("risk_degree", 0.95)
+        super().__init__(**kwargs)
+        self.ic_window = ic_window
+        self.ic_low = ic_low
+        self.ic_high = ic_high
+        self.low_risk = low_risk
+        self._ic_series = None
+
+    def _precompute_ic(self):
+        # Pred score (already available through self.signal)
+        cal = D.calendar()
+        start = str(cal[0].date())
+        end = str(cal[-1].date())
+        close = D.features(D.instruments("csi300"), ["$close"], start_time=start, end_time=end)
+        # FORWARD 20-day return matching label Ref($close,-21)/Ref($close,-1)-1:
+        #   fwd[t] = close[t+20] / close[t] - 1
+        # pct_change(-20) = close[t]/close[t+20] - 1, so forward = -pct/(-pct+1)... derive:
+        #   close[t+20]/close[t]-1 = -(close[t]/close[t+20]-1) / (close[t]/close[t+20])
+        #   = -pct_change(-20) / (1 + pct_change(-20))
+        pct_back = close["$close"].groupby(level="instrument").pct_change(-20)
+        fwd = -pct_back / (1 + pct_back)
+        df = close["$close"].to_frame("close")
+        df["fwd"] = fwd
+        df = df.dropna(subset=["fwd"])
+
+        pred = self.signal.get_signal(start_time=pd.Timestamp(start), end_time=pd.Timestamp(end))
+        if isinstance(pred, pd.DataFrame):
+            pred = pred.iloc[:, 0]
+        p = pred.to_frame("score")
+        m = p.join(df["fwd"], how="inner").dropna()
+
+        def _daily_ic(g):
+            if len(g) < 5:
+                return np.nan
+            return g["score"].corr(g["fwd"], method="spearman")
+
+        daily = m.groupby(level="datetime").apply(_daily_ic).dropna()
+        self._ic_series = daily.sort_index()
+
+    def _current_ic(self, cur_ts):
+        ic = self._ic_series
+        # CAUSALITY: the IC computed at date t uses close[t+20] (forward 20d).
+        # At decision time cur_ts, the most recent usable IC is the one whose
+        # forward window is fully realized: it must have been computed at least
+        # 20 trading days before cur_ts.  Shift the series back by 20 trading
+        # days so that at decision time cur_ts we only see fully-realized ICs.
+        usable_ic = ic[ic.index <= cur_ts].shift(20)
+        usable_ic = usable_ic.dropna()
+        if len(usable_ic) < 20:
+            return 1.0
+        return usable_ic.iloc[-self.ic_window:].mean()
+
+    def generate_trade_decision(self, execute_result=None):
+        if self._ic_series is None:
+            self._precompute_ic()
+
+        trade_step = self.trade_calendar.get_trade_step()
+        _, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        cur_ts = pd.Timestamp(trade_end_time)
+
+        trailing_ic = self._current_ic(cur_ts)
+        if trailing_ic < self.ic_low:
+            self.risk_degree = self.low_risk
+        elif trailing_ic > self.ic_high:
+            self.risk_degree = 0.95
+        # else: keep previous risk_degree (hysteresis)
+        return super().generate_trade_decision(execute_result)
+
+
 class IndustryProcessor(Processor):
     """Add industry-relative features (industry mean, excess, rank)."""
 
