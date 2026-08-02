@@ -167,6 +167,8 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **数据**: 244 的 qlib 数据须定期 `update_baostock.py` 同步 (上次 2026-08-02 更新到 2026-07-31); 更新跑完 dump features 后需确认日历已到最新
 - **Alpha158Industry 缓存** (5.4GB pkl) 已传至 244, 保证两台机器 pred 一致 (0.1pp 内浮点抖动可接受)
 - **WSL 后台任务坑**: nohup 会在 ssh 会话断开时被杀; 必须 `setsid cmd > log 2>&1 < /dev/null &` 才能存活
+- **WSL 默认 root 坑 (重要)**: 244 的 WSL 默认用户是 root, ps1 里 `wsl -e bash` 会以 root 跑 (HOME=/root), 导致 `Path.home()/qlib` = `/root/qlib` 不存在 → `No module named 'scripts'`. **ps1 必须用 `wsl -u tc bash` 指定 tc 用户**
+- **定时任务**: 244 上已设 2 个 Windows 任务 — `QlibUpdateData` (每晚 21:00, update_data_only.ps1) + `QlibDailyFull` (每早 9:00, run_daily.ps1 完整回测+下单)
 - **部署包**: `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ 即可
 - **244 桌面残留**: rolling_csi300_install.tar.gz (备份, 可删)
 
