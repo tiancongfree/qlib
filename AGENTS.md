@@ -171,6 +171,9 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **定时任务**: 244 上已设 2 个 Windows 任务 — `QlibUpdateData` (每晚 21:00, update_data_only.ps1) + `QlibDailyFull` (每早 9:00, run_daily.ps1 完整回测+下单)
 - **部署包**: `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ 即可
 - **244 桌面残留**: rolling_csi300_install.tar.gz (备份, 可删)
+- **完整 flow 已验证 (2026-08-02)**: run_daily.ps1 全链路跑通 (数据更新→回测 ICTiming 0.198→sync 下单), 买入/卖出挂单均成功提交
+- **A股 T+1 资金约束 (重要)**: sync 一次性提交"卖+买", 但**当日卖出资金次日才到账** → 买单冻结当日可用现金, 若买入总额超过当日可用资金, 尾部买单会报 "可用余额不够" 失败 (2026-08-02: 300450/000425 差 ~4000元未买). **非脚本 bug, 属正常现象**: 次日卖出资金到账后再跑一次 flow 即可补齐
+- **sync 挂单为限价单**: 基于 baostock 最新真实价 ±0.2% (price_slippage), 收盘后挂留待次日开盘成交; 买入总数受 invest_ratio=0.95 限制但受 T+1 可用资金约束更强
 
 ## 数据管道: bin 格式与 baostock 坐标系 (必读)
 
