@@ -104,6 +104,9 @@ def _load_real_prices(instruments: list) -> dict:
     import baostock as _bs
     _bs.login()
     prices = {}
+    # Use the latest trading date from qlib calendar
+    cal = [l.strip() for l in open(_QLIB_DIR / "calendars/day.txt")]
+    end_date = cal[-1]
     for inst in instruments:
         ex = inst[:2].lower()
         code = inst[2:]
@@ -111,7 +114,7 @@ def _load_real_prices(instruments: list) -> dict:
         try:
             rs = _bs.query_history_k_data_plus(
                 bs_sym, "close",
-                start_date="2026-05-29", end_date="2026-05-29",
+                start_date=end_date, end_date=end_date,
                 frequency="d", adjustflag="2",
             )
             if rs.error_code == "0" and rs.next():
@@ -125,16 +128,39 @@ def _load_real_prices(instruments: list) -> dict:
     return prices
 
 
+def _load_factor(inst: str, end_date: str = None) -> float:
+    """Load the qlib adj-factor for a stock on the latest trading day.
+
+    qlib stores amount in adjusted (前复权) shares.  real_shares = amount * factor.
+    """
+    import numpy as np
+    cal = [l.strip() for l in open(_QLIB_DIR / "calendars/day.txt")]
+    cal_idx = {d: i for i, d in enumerate(cal)}
+    if end_date is None:
+        end_date = cal[-1]
+    path = _QLIB_DIR / "features" / inst.lower() / "factor.day.bin"
+    if not path.exists():
+        return None
+    n = np.fromfile(str(path), dtype="<f4")
+    start = int(n[0])
+    vals = n[1:]
+    i = cal_idx.get(end_date, 0) - start
+    if 0 <= i < len(vals):
+        v = float(vals[i])
+        return v if np.isfinite(v) and v > 0 else None
+    return None
+
+
 def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
     result = {}
-    total_amount = target["amount"].sum()
-    cash = target["cash"].iloc[0] if "cash" in target.columns else 0
-    total_portfolio = total_amount + cash
-    scale = max_total / total_portfolio if (max_total and total_portfolio) else 1.0
-
     instruments = [idx[0] for idx in target.index]
     real_prices = _load_real_prices(instruments)
 
+    # Convert qlib adjusted (前复权) amounts to real shares & real market value.
+    # qlib stores amount in adjusted shares and price in adjusted price:
+    #   real_shares = amount * factor
+    #   real_value  = real_shares * real_price
+    items = []
     for idx, row in target.iterrows():
         instrument = idx[0]
         amount = row.get("amount")
@@ -143,9 +169,17 @@ def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
         real_price = real_prices.get(instrument)
         if not real_price or real_price <= 0:
             continue
-        scaled_amount = amount * scale
-        shares = scaled_amount / real_price
-        qty = _to_lots(shares)
+        factor = _load_factor(instrument)
+        real_shares = amount * factor if factor and factor > 0 else amount
+        real_value = real_shares * real_price
+        items.append((instrument, real_shares, real_value))
+
+    total_real_value = sum(v for _, _, v in items)
+    scale = max_total / total_real_value if (max_total and total_real_value) else 1.0
+
+    for instrument, real_shares, real_value in items:
+        scaled_shares = real_shares * scale
+        qty = _to_lots(scaled_shares)
         if qty > 0:
             result[instrument] = qty
     return result
@@ -157,6 +191,7 @@ def sync_positions(
     client: TradeClient,
     dry_run: bool = True,
     max_total: float = None,
+    price_slippage: float = 0.002,
 ):
     """
     Compare target vs actual and place buy/sell orders.
@@ -198,38 +233,64 @@ def sync_positions(
             return str(text)
         return text.replace("\r", "").replace("\n", " ").strip()
 
-    def do(name, ths_code, qty):
+    def do(name, ths_code, qty, limit_price=None):
         print(f"  {name:6s} {ths_code} x {qty}", flush=True)
         if not dry_run:
             try:
+                # easyths at this broker rejects market orders (市价委托) for most
+                # stocks, so we place LIMIT orders instead.  For buys we set the
+                # limit slightly above the reference price and for sells slightly
+                # below, to maximize the chance of immediate execution.
                 if name.startswith("SELL"):
-                    r = client.market_sell(stock_code=ths_code, quantity=qty)
+                    if limit_price:
+                        r = client.sell(stock_code=ths_code, price=limit_price, quantity=qty)
+                    else:
+                        r = client.market_sell(stock_code=ths_code, quantity=qty)
                 else:
-                    r = client.market_buy(stock_code=ths_code, quantity=qty)
+                    if limit_price:
+                        r = client.buy(stock_code=ths_code, price=limit_price, quantity=qty)
+                    else:
+                        r = client.market_buy(stock_code=ths_code, quantity=qty)
                 status = "OK" if r.get("success") else f"FAIL: {_sanitize(r.get('message', ''))}"
                 print(f"    -> {status}", flush=True)
             except TradeClientError as e:
                 print(f"    -> ERROR: {e}", flush=True)
 
+    # Reference prices (real latest close from baostock) for limit orders.
+    # Query both target (buy) and to-sell stocks so sells also get a limit price.
+    price_query_codes = set(target_stocks.keys()) | set(stocks_to_sell)
+    ref_prices = _load_real_prices(list(price_query_codes))
+
     # ---- Sell stocks not in target ----
     for code in sorted(stocks_to_sell):
         qty = int(actual[code])
-        do("SELL", _qlib_to_ths(code), qty)
+        ths = _qlib_to_ths(code)
+        rp = ref_prices.get(code) or ref_prices.get(ths)
+        # sell slightly below reference to fill; if no price, fall back to market
+        limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+        do("SELL", ths, qty, limit_price)
 
     # ---- Buy stocks in target but not in actual ----
     for code in sorted(stocks_to_buy):
-        do("BUY", _qlib_to_ths(code), target_stocks[code])
+        ths = _qlib_to_ths(code)
+        rp = ref_prices.get(code) or ref_prices.get(ths)
+        # buy slightly above reference to fill
+        limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+        do("BUY", ths, target_stocks[code], limit_price)
 
     # ---- Adjust quantities for stocks in both ----
     for code in sorted(stocks_in_both):
         target_qty = target_stocks[code]
         actual_qty = int(actual[code])
         diff = target_qty - actual_qty
-        ths_code = _qlib_to_ths(code)
+        ths = _qlib_to_ths(code)
+        rp = ref_prices.get(code) or ref_prices.get(ths)
         if diff > 0:
-            do("BUY+", ths_code, diff)
+            limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+            do("BUY+", ths, diff, limit_price)
         elif diff < 0:
-            do("SELL-", ths_code, abs(diff))
+            limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+            do("SELL-", ths, abs(diff), limit_price)
 
     if dry_run:
         print(f"\n{'=' * 60}")
@@ -245,6 +306,7 @@ def main(
     last_positions_csv: str = None,
     dry_run: bool = True,
     invest_ratio: float = 0.95,
+    price_slippage: float = 0.002,
 ):
     print("=" * 60)
     print("  Qlib → EasyTHS Real-time Sync")
@@ -346,7 +408,7 @@ def main(
             else:
                 print(f"  No pending orders to cancel or cancel failed: {cancel_result.get('message')}")
 
-        sync_positions(target, actual, client, dry_run=dry_run, max_total=max_total)
+        sync_positions(target, actual, client, dry_run=dry_run, max_total=max_total, price_slippage=price_slippage)
 
 
 if __name__ == "__main__":
