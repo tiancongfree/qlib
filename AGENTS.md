@@ -150,11 +150,25 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 ## 数据/环境备注
 
 - qlib 数据: ~/.qlib/qlib_data/cn_data
-- 机器: 15GB RAM + 23GB swap, 20 线程, 训练峰值依赖 swap 兜底
+- **当前研究机** (DESKTOP-JTV5CLG, WSL IP 192.168.52.105): 15GB RAM + 23GB swap, 20 线程, 训练峰值依赖 swap 兜底; 回测/研究/模型训练
 - PIT 记录格式: 20 字节 (date+period+value+_next), financial/<code>/<field>_q
 - 日频 bin 与 PIT 逐日一致 (243/243 天验证)
 - tushare 代理: API_URL 默认 http://jiaoch.site, token 从环境变量 `TUSHARE_TOKEN` 读取 (已从代码中移除, 勿硬编码)
 - 无中文字体 (matplotlib 需用英文标签)
+
+## 交易执行机 (192.168.11.244, 重要)
+
+- **角色**: 实盘交易执行机 (跑 run_daily.ps1 → WSL 更新数据+回测 → easyths 下单), 与当前研究机分离
+- **识别**: Windows 主机名 desktop-6muresa; WSL 发行版 Ubuntu (WSL2), **默认 root 登录**; WSL 里有 tc 用户 (HOME=/home/tc, qlib 在 /home/tc/qlib)
+- **SSH**: 连的是 **244 的 Windows OpenSSH** (whoami 返回 `desktop-6muresa\tc`), 不是 WSL 直连; 密钥 `~/.ssh/id_ed25519_new` (注意默认 id_ed25519 不存在, 必须 `-i` 指定)
+- **操作 WSL 的方式**: 通过 Windows ssh 执行 `wsl -u tc bash -lc '命令'`; 但复杂引号/管道/`&&` 会被 Windows cmd 破坏, **最稳妥 = 把 bash 脚本 scp 到 C:\Users\tc\Desktop 再 `wsl -u tc bash /mnt/c/Users/tc/Desktop/脚本.sh`**
+- **Windows 桌面文件在 WSL 里的路径**: `/mnt/c/Users/tc/Desktop/`
+- **easyths 服务**: 运行在 244 Windows 侧, 端口 7648, config 路径 `C:\ProgramData\miniforge3\Scripts\easyths.exe --config C:\Users\tc\easyths\config.toml`; 当前机器 (52.105) 的 sync_to_realtime.py 连它下单
+- **数据**: 244 的 qlib 数据须定期 `update_baostock.py` 同步 (上次 2026-08-02 更新到 2026-07-31); 更新跑完 dump features 后需确认日历已到最新
+- **Alpha158Industry 缓存** (5.4GB pkl) 已传至 244, 保证两台机器 pred 一致 (0.1pp 内浮点抖动可接受)
+- **WSL 后台任务坑**: nohup 会在 ssh 会话断开时被杀; 必须 `setsid cmd > log 2>&1 < /dev/null &` 才能存活
+- **部署包**: `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ 即可
+- **244 桌面残留**: rolling_csi300_install.tar.gz (备份, 可删)
 
 ## 数据管道: bin 格式与 baostock 坐标系 (必读)
 
