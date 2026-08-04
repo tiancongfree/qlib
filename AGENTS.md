@@ -207,6 +207,8 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - 日频 bin 与 PIT 逐日一致 (243/243 天验证)
 - tushare 代理: API_URL 默认 http://jiaoch.site, token 从环境变量 `TUSHARE_TOKEN` 读取 (已从代码中移除, 勿硬编码)
 - 无中文字体 (matplotlib 需用英文标签)
+- **两机数据对齐 (重要, 2026-08-04 验证)**: 本机 vs 244 的持仓对比**必须先对齐数据端** (日历 + instruments + features bin), 否则数据端差 1-2 天持仓必然不同 (非 bug)。已验证: 本机对齐到 08-03 后, 与 244 回测持仓 **0/29 差异** (07-31 和 08-03 两天都完全一致) → position.py sort patch 生效, 两机同代码/同模型/同数据下回测确定且一致
+- **baostock 更新不稳定 → 244 数据作本机数据源**: 2026-08-04 baostock 虽能 login 但批量下载/单只查询均卡死; 244 每天早上自动更新成功 (数据最新)。若本机需对齐数据, 可从 244 打包增量: 244 上 `find features -name "*.bin" -newermt "<上次同步日>" -print0 | tar --null -cf /tmp/incr.tar -T -` + `tar -rf` 追加 `calendars/day.txt instruments/all.txt instruments/csi300.txt`, scp 到 Windows 家目录再取回, 本机解压到 `features/` 覆盖 + 替换日历/instruments (bin 是完整文件可直接覆盖)
 
 ## 交易执行机 (192.168.11.244, 重要)
 
