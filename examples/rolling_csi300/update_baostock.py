@@ -20,12 +20,20 @@ OVERLAP_DAYS = 5  # enough for ratio computation
 CSI300_MV_THRESHOLD = 500e8  # 500亿流通市值: 大概率进 CSI300 (当前成分股最小约212亿)
 
 def _latest_trading_day() -> datetime:
-    """Return the most recent probable trading day (date only, time=midnight)."""
-    d = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-    if d.weekday() == 5:   # Saturday -> Friday
+    """Return the most recent probable trading day (date only, time=midnight).
+
+    A-share daily bars are only finalized after the 15:00 close.  Before close
+    (e.g. the 09:30 morning task) today's bar does not exist yet, so fall back
+    to the previous trading day.  This prevents the morning run from treating
+    "today" as a new day and re-downloading all stocks for nothing (the evening
+    task already updated to the last completed trading day).
+    """
+    now = datetime.now()
+    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if now.hour < 16:  # before market close + buffer, today's bar not published
         d -= timedelta(days=1)
-    elif d.weekday() == 6:  # Sunday -> Friday
-        d -= timedelta(days=2)
+    while d.weekday() >= 5:  # Saturday/Sunday -> Friday
+        d -= timedelta(days=1)
     return d
 
 def _read_last_update() -> datetime | None:
