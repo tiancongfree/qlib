@@ -237,12 +237,32 @@ def sync_positions(
     """
     target_stocks = _parse_target_stocks(target, max_total)
 
+    # Target weights {code: weight} for priority ordering of orders.
+    # BUY orders are placed heavy-weight first so that if T+1 available cash
+    # runs out, the largest target positions still get bought first; SELL orders
+    # are placed light-weight first so small positions are cleaned up before the
+    # bigger ones (their proceeds only free up next day anyway).
+    target_weights = {}
+    if "weight" in target.columns:
+        for idx, row in target.iterrows():
+            w = row.get("weight")
+            if w is not None and w > 0:
+                target_weights[idx[0]] = float(w)
+
+    def _weight(code: str) -> float:
+        return target_weights.get(code, 0.0)
+
     target_set = set(target_stocks.keys())
     actual_set = set(actual.keys())
 
     stocks_to_sell = actual_set - target_set
     stocks_to_buy = target_set - actual_set
     stocks_in_both = target_set & actual_set
+
+    # Sell: light weight first (absent weights -> plain code sort)
+    stocks_to_sell_sorted = sorted(stocks_to_sell, key=lambda c: (_weight(c), c))
+    # Buy: heavy weight first (absent weights -> plain code sort)
+    stocks_to_buy_sorted = sorted(stocks_to_buy, key=lambda c: (-_weight(c), c))
 
     print(f"\n{'=' * 60}")
     print(f"  Target stocks: {len(target_set)}")
@@ -288,7 +308,7 @@ def sync_positions(
     ref_prices = _load_real_prices(list(price_query_codes))
 
     # ---- Sell stocks not in target ----
-    for code in sorted(stocks_to_sell):
+    for code in stocks_to_sell_sorted:
         qty = int(actual[code])
         ths = _qlib_to_ths(code)
         rp = ref_prices.get(code) or ref_prices.get(ths)
@@ -297,7 +317,7 @@ def sync_positions(
         do("SELL", ths, qty, limit_price)
 
     # ---- Buy stocks in target but not in actual ----
-    for code in sorted(stocks_to_buy):
+    for code in stocks_to_buy_sorted:
         ths = _qlib_to_ths(code)
         rp = ref_prices.get(code) or ref_prices.get(ths)
         # buy slightly above reference to fill
@@ -305,7 +325,9 @@ def sync_positions(
         do("BUY", ths, target_stocks[code], limit_price)
 
     # ---- Adjust quantities for stocks in both ----
-    for code in sorted(stocks_in_both):
+    # BUY+ (add) heavy-weight first; SELL- (trim) light-weight first, so that
+    # when T+1 cash is short the heavy positions get topped up preferentially.
+    for code in sorted(stocks_in_both, key=lambda c: (-_weight(c), c)):
         target_qty = target_stocks[code]
         actual_qty = int(actual[code])
         diff = target_qty - actual_qty
