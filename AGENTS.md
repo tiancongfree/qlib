@@ -36,9 +36,21 @@
 - **验证**: patch 后 ndrop=1 连跑两次完全一致; ndrop=2/3/5 结果与 patch 前一致 (无偏差)
 - **教训**: 任何回测对比前必须确认确定性; 早期 n_drop 敏感性结论受此污染
 
+#### 2026-08-04 生产事故: sort patch 未同步到 244 (重要!)
+- **事故**: 244 实盘机 08-04 09:30 自动 flow 下单, 实际买入 12 只 (含宇通 500 股 ¥1.59w), 其中 9 只是非正确 target 的股票
+- **根因**: 本机 position.py 有 sort patch (commit b5ec5b21), 但**之前部署 244 只用 tar 包同步 examples/ 文件夹, 漏掉 qlib 源码 patch** → 244 的 `get_stock_list()` 仍是非确定 set 顺序 → 每次回测随机持仓路径 (宇通 3285 vs 443 vs 406, pred 却 100% 一致)
+- **诊断链**: 同一 rolling_models/配置/数据, 仅 exp_name 不同回测结果迥异 → pred 对比 diff=0 → 定位到 position.py 差异 (本机有 sort, 244 无)
+- **修复**: 244 position.py 打上同款 sort patch; 验证 patch 后连续 2 次回测宇通=443 完全一致; 禁用 QlibDailyFull 防再错单
+- **教训 (重要)**: **手动 patch/tar 同步不靠谱, 改用 git 管理** — 见"运行方式"里 git 部署部分; 本事故后 244 一律 `git pull` 获取代码
+
 ### 4. 因子衰减分析
 - 无结构性衰减 (2020-2022 IC 0.077 vs 2023-2026 IC 0.077)
 - IC 呈周期性波动 (低谷 2021H2/2025H2, 高效 2020H2/2022Q2/2024H1), 低谷后可恢复
+- **2026-08 复核** (analyze_ic_decay.py, 数据到 2026-04-14):
+  - 半年度 IC_IR: 2020H2 0.1265(峰值) / 2021H1 0.0328(谷) / 2022H1 0.0937 / 2024H1 0.1959(峰值) / **2025H2 -0.0796(谷)** / **2026H1 0.0948(已恢复)**
+  - 前后半对比: 2020~2023 mean IC 0.0631 vs 2023~2026 0.0545 → 无结构性衰减
+  - 滚动60日IC 最低 -0.239 (2025-09-08, 此时 ICTiming 已降仓), 最新 0.092 (>ic_low 0.04, 满仓)
+  - **⚠️ 数据缺口**: pred/label 只到 2026-04-14 (Bug 3 残留), 2026Q2 -0.089 仅9天不可信; 需 baostock 恢复后重跑滚动回测补 4-7 月数据
 
 ### 4b. 尾部爬升机制 (仓位动力学, 量化验证)
 - **现象**: 23/339 只持仓股出现"尾部爬升"——进入持仓时 rank≥24 (权重~1-2%), 随后 rank 逐步升到前 15 甚至前 5, 权重翻 3-8 倍
@@ -103,6 +115,20 @@
 - **成本不变**: 各档总成本均 ~10.3-10.6%, min_cost 影响在 50w 也可忽略 (单笔仍远高于 2k)
 - **实盘启示**: 策略资金规模甜点在 **50-100w**; 1000w 收益反而下滑 ~4pp; 无需为"资金大"而加仓
 
+### 7e. Volume 因子 (VOLUME0-4) → 已存档, 不作为正式配置
+- **动机**: Alpha158 源码里 volume 块 (30 个 rolling 量因子: VMA/VSTD/WVMA/VSUMP/VSUMN/VSUMD) 默认未启用, 想试增量量能信息
+- **实现**: `custom_handler.py` Alpha158Industry.get_feature_config 加 `"volume": {"windows":[0,1,2,3,4]}` → 172→177 因子; 配置文件 `rolling_config_volume.yaml`, 实验 `rolling_csi300_lgbm_volume` (27 期 full rolling 训练, 39 分钟)
+- **结果** (2020-2026 全量回测, 对比 baseline n_drop=1 + ICTiming):
+
+| 指标 | baseline | +volume | Δ |
+|---|---|---|---|
+| RankIC | 0.0751 | 0.0751 | 0 |
+| 净超额年化 | 16.78% | 17.87% | **+1.09pp** |
+| 净 IR | 1.29 | 1.44 | +0.15 |
+| 最大回撤 | -17.6% | -18.4% | -0.8pp (略差) |
+
+- **结论**: 净收益/IR 有提升, 但 IC 持平、回撤略深; **用户决定不作为正式配置, 结果仅存档** (不上生产, 244 无需重训/重算缓存)
+
 ### 8. IC 动态降仓 (ICTimingStrategy) → 已纳入生产
 - **策略**: 基于滚动 RankIC (前瞻20天收益, 正确口径) 动态调仓; IC 低谷 (滚动60日 < ic_low=0.04) 时降 risk_degree 到 0.5, 恢复 (ic_high=0.06) 回满仓 0.95
 - **无未来函数 (关键修复)**: 初版用 `pct_change(20)` (回顾收益) 算 IC, 方向错误导致降仓信号无意义; 修复为**前瞻20天收益** (`close[t+20]/close[t]-1`) + **20交易日因果滞后** (`shift(20)`, 决策时只用已完全实现的IC)
@@ -110,6 +136,32 @@
 - **全量回测 (生产配置)**: 净年化 17.87% vs 原始 17.12% (+0.8pp), 净IR 1.44 vs 1.29, 回撤 -18.4% vs -19.8%; 换手/成本不变 (纯降仓防守)
 - **教训**: 任何动态策略必须检查①IC收益方向 (前瞻 vs 回顾) ②因果滞后 (用未来窗口数据必须 shift); 否则"看似有效"是伪信号
 - **注意**: 样本外仅1.5年, 实盘需持续监控 IC; 若 IC 长期失效 (如连续1年 <0.03) 应暂停策略而非仅降仓
+
+### 9. 滚动模型退化探索 (2026-08-03, 修复已回退)
+
+#### 现象: 最近 4 期滚动模型只训练到 1 棵树
+- 检查 `rolling_models_20260801180017` (ndrop1 生产基线) 各期模型 `params.pkl` 的 `num_trees()`: 最近 4 期 (2025-09/2025-12/2026-03/2026-06) 只有 **1-3 棵树** (文件 ~34KB vs 正常 1.5MB, 预测只有 ~54 个不同取值), 早期期次正常 (44-269 棵树)
+- **根因**: 生产 pred 月度 RankIC 在 **2025-06~08 深度塌陷** (−0.15/-0.20/-0.25, 因子关系短暂反转, 即 4 节记录的 2025H2 IC 谷)。所有 4 个退化期次的 **valid 窗口都覆盖这个塌陷期** → 加树永远不改善 valid loss → early stopping 第 1 轮触发 → 1 棵树
+- 验证: 末期限模型 (931caacf, test 2026-06-15→07-31) valid loss 从第 0 轮起就不下降 (0.9969→1.006), train loss 却降到 0.944 (能拟合但无法泛化)
+- **影响**: 当前 pred (含 2026-07-31 迈瑞 262/300) 来自退化模型, 排名低置信度
+
+#### 尝试的修复 (RobustLGBModel min-trees floor) → 已回退
+- 实现: `custom_handler.py` 加 `RobustLGBModel` (自定义 early stopping, 当 valid 从未改善时强制保留 min_iterations=30 棵树), `rolling_config.yaml` 切换模型类
+- 干净验证 (用原缓存对比, 各期树数与原基线 EXACTLY 一致, 仅 3 个退化期 1→30 棵): **净年化 17.87%→15.89%, IR 1.44→1.31, 回撤 -18.4%→-25.9% → 修复是负面的**
+- **为什么负面**: 30 棵树的模型在 alpha 塌陷期过拟合训练数据的反转关系; 月度 IC 显示 2026-03/04/05 (回撤段) 明显变差 (−0.055/-0.020/-0.036), 仅 2026-07 (+0.18, n=999 不完整月) 假性改善
+- **结论**: 退化 1 树模型是模型对低 alpha 期的**自然稳健响应** (第一棵树=最强单一分裂), 不是性能问题 → **不修, 维持原 LGBModel**
+- 教训: "模型树数少=有问题" 的直觉不成立; 任何"修复"必须用干净对比 (同缓存) 验证, 且警惕不完整月份 (n<1000) 的假性改善
+
+#### 过程中发现/修正 (重要)
+- **缓存重建误诊**: 以为 Alpha158Industry cache 的 VMA20 爆到 4e18 是缓存过期, 实际是**真实停牌** (东方证券 2026-04-20→05-06、拓荆科技 2026-06-29→07-10, baostock 确认成交量空/价格冻结) → 缓存无需重建
+- **缓存重建引入 label bug**: rebuild 时未带 label override, 缓存用了默认 **1 日 label** (应为 20 日 `Ref($close,-21)/Ref($close,-1)-1`), 导致 fixed/fixed2 两次重训全部失效 (5.3%/7.0%) → 已修正
+- **原缓存已找回**: 本机 5bf590b2fe 被重建覆盖后, 从 244 取回原始副本 (md5 `7bfd40e6...`, 5407275632 bytes), 现本机已恢复
+- **训练确定性**: 同缓存同代码训练结果完全确定 (155/155/155), 但原缓存 vs 重建缓存给不同树数 (142 vs 155) → 缓存内容确实不同, 对比必须用同一缓存
+
+#### 状态
+- 代码已回退: `rolling_config.yaml` (LGBModel)、`run_rolling.py`、`custom_handler.py` 恢复原样; `rebuild_handler_cache.py`/`test_last_period_fix.py` 已删除
+- mlruns 已清理: `rolling_csi300_lgbm_ndrop1_fixed/fixed2/fixed3/fixed4` + 对应 4 个 `rolling_models_2026...` + 测试临时 `Experiment` 共 9 个实验已删除 (mlflow 移至 .trash, 磁盘未释放; 如需回收磁盘需手动删 mlruns/.trash)
+- 生产管线回到原始 17.87% 状态, 无需重训
 
 ## 运行方式
 
@@ -168,12 +220,26 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **Alpha158Industry 缓存** (5.4GB pkl) 已传至 244, 保证两台机器 pred 一致 (0.1pp 内浮点抖动可接受)
 - **WSL 后台任务坑**: nohup 会在 ssh 会话断开时被杀; 必须 `setsid cmd > log 2>&1 < /dev/null &` 才能存活
 - **WSL 默认 root 坑 (重要)**: 244 的 WSL 默认用户是 root, ps1 里 `wsl -e bash` 会以 root 跑 (HOME=/root), 导致 `Path.home()/qlib` = `/root/qlib` 不存在 → `No module named 'scripts'`. **ps1 必须用 `wsl -u tc bash` 指定 tc 用户**
-- **定时任务**: 244 上已设 2 个 Windows 任务 — `QlibUpdateData` (每晚 21:00, update_data_only.ps1) + `QlibDailyFull` (每早 9:00, run_daily.ps1 完整回测+下单)
-- **部署包**: `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ 即可
+- **定时任务**: 244 上已设 2 个 Windows 任务 — `QlibUpdateData` (每晚 21:00, update_data_only.ps1) + `QlibDailyFull` (每早 9:30, run_daily.ps1 完整回测+下单)。**2026-08-02 起 QlibDailyFull 已禁用** (观察期手动 sync); **08-04 事故后再次禁用** (QlibDailyFull 曾于 08-03 被重新启用, 08-04 09:30 因 position.py 非确定 bug 错单, 现已禁用防再错)
+- **部署方式 (2026-08-04 起, 用 git 不用 patch/tar)**: 本仓库 fork 为 `congt` (github.com/tiancongfree/qlib), 分支 `snapshot/rolling_csi300`。**所有代码改动走本机 commit → push 到 congt → 244 `git pull`**。严禁手动 patch/tar 同步 (见 3b 事故教训)。244 pull 后需注意: 若 position.py 有 sort patch 但 git 显示 clean, 说明已含在历史 commit (b5ec5b21) 中; 部署 qlib 源码改动后 244 需重装 `.venv` 中对应包或确认 import 用本地源码
+- **244 同步流程**: `git remote add congt https://github.com/tiancongfree/qlib.git` → `git fetch congt` → `git checkout snapshot/rolling_csi300` → `git pull congt snapshot/rolling_csi300`。数据/缓存 (18GB pkl、mlruns 实验) 仍单独同步, 不入 git
+- **run_workflow.py 默认 exp_name**: 已改为生产实验 `rolling_csi300_lgbm_ndrop1` (勿再改回 `rolling_csi300_lgbm` — 那是旧实验, 历史持仓轨迹不同)
+- **部署包 (已废弃)**: 旧方式 `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ — **不再使用, 仅备份参考**
 - **244 桌面残留**: rolling_csi300_install.tar.gz (备份, 可删)
 - **完整 flow 已验证 (2026-08-02)**: run_daily.ps1 全链路跑通 (数据更新→回测 ICTiming 0.198→sync 下单), 买入/卖出挂单均成功提交
 - **A股 T+1 资金约束 (重要)**: sync 一次性提交"卖+买", 但**当日卖出资金次日才到账** → 买单冻结当日可用现金, 若买入总额超过当日可用资金, 尾部买单会报 "可用余额不够" 失败 (2026-08-02: 300450/000425 差 ~4000元未买). **非脚本 bug, 属正常现象**: 次日卖出资金到账后再跑一次 flow 即可补齐
-- **sync 挂单为限价单**: 基于 baostock 最新真实价 ±0.2% (price_slippage), 收盘后挂留待次日开盘成交; 买入总数受 invest_ratio=0.95 限制但受 T+1 可用资金约束更强
+- **sync 挂单为限价单**: 基于**腾讯行情实时价** (qt.gtimg.cn, 批量 50 只/请求, 替代不可用的 baostock) ±0.2% (price_slippage); 买入总数受 max_total 限制但受 T+1 可用资金约束更强
+- **baostock 服务端不可用 (2026-08-02 起)**: login 挂起 (Connection reset by peer), 两台机器都如此, 疑似服务端故障; 实时价改用腾讯行情 API (`_load_real_prices`), 数据更新用 `--skip-update` 跳过
+- **max_total 手动写死 (分批建仓阶段, 重要)**: `sync_to_realtime.py:426` 已把 `max_total = total_assets * invest_ratio` 注释掉, **写死 `max_total = 200000` (20w)**。注释标明切换点: 40w→400000, 最终 60w→600000。机制: max_total 是目标组合市值上限, `_parse_target_stocks` 按 `scale = max_total / 目标总市值` 等比缩放所有股票 → **只改 max_total 即可自动实现"调仓+加仓"**, 不用改任何其他参数
+
+### 分批建仓方案 (2026-08-02 起, 20w→40w→60w)
+
+- **目标组合稳定性 (已验证)**: 回测 `account: 1000000` (100w) 是 config **固定常量**, lastday CSV 里各股 amount/weight 是**相对权重**, 与实盘账户资金**无关**。重跑回测只要数据/模型不变, 相对权重完全一致 → 目标名单稳定, 分批基准可靠
+- **重合度验证**: qlib lastday 持仓 29 只, 实时价 29 只全获取 (无缺失); 60w 档 sync 目标 29 只 = qlib **100% 重合**; 20w 档 21 只 (8 只小仓股整手化归零); 5.7w 档 10 只
+- **资金缩放只影响整手粒度**: scale 越小, 小仓位股 (<4.5% 权重) 越先被 `_to_lots` 归零。资金越大自动解锁越多小仓股, 3 笔组齐完整组合
+- **前 10 只权重股占 55.7%** (60w 目标): 600346 9.85% / 600585 7.16% / 002920 5.63% / 600233 5.36% / 601899 5.36% / 601058 4.89% / 000858 4.75% / 600588 4.73% / 688472 4.05% / 002594 3.89%。最大单只 <10% 无超集中
+- **sync 是调仓引擎, 非一次性建仓**: sync_positions 自动对比 target vs actual → BUY(新进)/SELL(剔除)/调整数量。每次跑 flow 自动完成"加仓+调仓", 中途 qlib 调仓天然被处理
+- **观察期策略 (用户选定)**: 第一笔买完观察一周**不跑 sync** (忽略每日调仓信号), 只看前 10 只 (55.7% 仓位) 实际表现; 一周后跑 flow 自动调仓+加仓; 若前 10 只系统性下跌 (疑似 IC 失效) 暂停加仓
 
 ## 数据管道: bin 格式与 baostock 坐标系 (必读)
 
@@ -226,11 +292,12 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **根因**: `update_baostock.py` map_and_scale 的 `factor_val = exist["last_factor"]` 增量更新时**沿用旧 factor 不重算** (line 533); 历史某次初始化复权基准错误后被永久固化
 - **关键澄清**: ① **qlib 日收益率完全正确** (相关系数 1.0000, 平均绝对差 0) → **所有回测结论不受影响** (收益是相对量); ② **`amount × close` = 真实市值自洽正确**; ③ 只有 **factor 不可靠**
 - **正确换算**: 真实市值 = `amount × close`; 真实股数 = `市值 / baostock真实价 (adjustflag=2)`
-- **sync_to_realtime.py 已修复**: 原用 `amount × factor` 算股数 → 改为 `amount × close / baostock真实价`; 对 factor 错误的股票 (紫金/三环等) 挂单数量修正
+- **sync_to_realtime.py 已修复**: 原用 `amount × factor` 算股数 → 改为 `amount × close / 腾讯行情实时价`; 对 factor 错误的股票 (紫金/三环等) 挂单数量修正
 - **未根治**: qlib factor 本身仍错, 但**不影响回测与 sync** (都已绕过 factor); 彻底修复需重建历史 bin 的 factor, 低优先级
 
 ### 运行注意
 - **baostock 长任务易被杀**: 单进程 >1 分钟会被环境终止, 无 traceback. 大批量下载必须分批 (每批 timeout 窗口内完成) 或用 BACKFILL_START/END chunk
+- **baostock 服务不可用 → 数据更新挂起**: 2026-08-02 起 login 挂起不退出, run_workflow.py 的 update 步骤已加 600s 超时保护 (超时自动跳过); 或直接 `--skip-update` 用已有数据跑回测+sync
 - **验证标准**: open/close 比值≈1; 除权日收益率对照; 与 baostock 前复权价连续
 - **已知无害异常**: 39 只 ST 股/新股上市首日/北交所 O/C 偏离 (历史遗留, 与 CSI300 无关)
 
@@ -255,6 +322,8 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 
 ## 当前待办/可继续方向
 
+- **(进行中) 分批建仓 20w→40w→60w**: 当前 max_total 写死 200000 (20w), 用户本周手动 sync 观察前 10 只 (55.7% 仓位); 下周无问题改 400000, 最后 600000 (见"分批建仓方案")
+- (可选) 观察期后重新启用 QlibDailyFull 定时任务 (当前已禁用)
 - (可选) IC 长期失效监控与自动暂停机制 — 已在 ICTiming 内降仓, 极端情况需暂停
 - (可选) 更高频/另类信号源 (分钟级) — 机构暴力来源, 需新数据
 - (可选) 减少训练窗口减轻 swap 依赖

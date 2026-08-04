@@ -98,33 +98,51 @@ def _to_lots(shares: float) -> int:
 _QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
 
 def _load_real_prices(instruments: list) -> dict:
-    """Query latest close prices from baostock for the given instruments.
-    Only queries ~20-30 stocks so it's fast (~2s).
-    Returns {qlib_code: price}."""
-    import baostock as _bs
-    _bs.login()
-    prices = {}
-    # Use the latest trading date from qlib calendar
-    cal = [l.strip() for l in open(_QLIB_DIR / "calendars/day.txt")]
-    end_date = cal[-1]
-    for inst in instruments:
+    """Query current real-time prices from Tencent quote API.
+
+    Returns {qlib_code: current_price}. Much faster and more reliable than
+    baostock (which needs a login session and hangs when the server is down).
+    Batch query is supported (comma-separated codes), so 30 stocks = 1 request.
+    """
+    import urllib.request
+
+    def _tencent_code(inst: str) -> str:
         ex = inst[:2].lower()
-        code = inst[2:]
-        bs_sym = f"{ex}.{code}"
+        return f"{ex}{inst[2:]}"
+
+    prices = {}
+    codes = [_tencent_code(c) for c in instruments]
+    if not codes:
+        return prices
+    # Batch in chunks of 50
+    for i in range(0, len(codes), 50):
+        chunk = codes[i : i + 50]
+        url = "https://qt.gtimg.cn/q=" + ",".join(chunk)
         try:
-            rs = _bs.query_history_k_data_plus(
-                bs_sym, "close",
-                start_date=end_date, end_date=end_date,
-                frequency="d", adjustflag="2",
-            )
-            if rs.error_code == "0" and rs.next():
-                row = rs.get_row_data()
-                close = float(row[0])
-                if close > 0:
-                    prices[inst] = close
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=10).read().decode("gbk")
+            for line in data.strip().split(";"):
+                parts = line.split("~")
+                if len(parts) > 4:
+                    # parts[2]=code, parts[3]=current price
+                    sym = parts[2]
+                    try:
+                        price = float(parts[3])
+                    except ValueError:
+                        continue
+                    if price > 0:
+                        # map back to qlib code: tencent returns 6-digit sym without
+                        # market prefix, but we requested ex+sym, so rebuild from the
+                        # request code (codes list) rather than parsing parts[2].
+                        qlib_code = None
+                        for _q in chunk:
+                            if _q[2:] == sym:
+                                qlib_code = _q.upper()
+                                break
+                        if qlib_code:
+                            prices[qlib_code] = price
         except Exception:
-            pass
-    _bs.logout()
+            continue
     return prices
 
 
@@ -179,8 +197,11 @@ def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
         real_shares = value / real_price
         items.append((instrument, real_shares, value))
 
-    total_value = sum(v for _, _, v in items)
-    scale = max_total / total_value if (max_total and total_value) else 1.0
+    # Scale based on REAL market value so that total buy value <= max_total.
+    # Using adjusted value (amount*qlib_price) as the denominator is wrong when
+    # factor is off: it makes scale too big/small vs actual RMB value.
+    total_real_value = sum(rs * real_prices[inst] for inst, rs, _ in items)
+    scale = max_total / total_real_value if (max_total and total_real_value) else 1.0
 
     for instrument, real_shares, value in items:
         scaled_shares = real_shares * scale
@@ -399,7 +420,10 @@ def main(
             sys.exit(1)
         print(" OK", flush=True)
         total_assets = float(funds["data"].get("总资产", 0))
-        max_total = total_assets * invest_ratio
+        # max_total = total_assets * invest_ratio  # 动态: 总资产 × 0.95
+        # 手动写死 max_total (分批建仓阶段, 2026-08-02)
+        #  20w → 200000  | 40w → 400000  | 最终 60w → 600000
+        max_total = 200000
         print(f"  Account total assets: {total_assets:.2f}")
         print(f"  Invest ratio: {invest_ratio:.0%} -> target portfolio: {max_total:.2f}")
 

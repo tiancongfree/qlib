@@ -34,11 +34,15 @@ def step_header(step: int, title: str):
     print(f"{'=' * 60}\n")
 
 
-def run(cmd: list, step_name: str) -> bool:
+def run(cmd: list, step_name: str, timeout: int | None = None) -> bool:
     print(f"  Running: {' '.join(str(a) for a in cmd)}")
     t0 = time.time()
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    result = subprocess.run(cmd, cwd=HERE, env=env)
+    try:
+        result = subprocess.run(cmd, cwd=HERE, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"  [{step_name}] TIMED OUT after {timeout}s (killed)")
+        return False
     elapsed = time.time() - t0
     if result.returncode == 0:
         print(f"  [{step_name}] Done in {elapsed:.1f}s\n")
@@ -51,12 +55,13 @@ def main(
     api_key: str = "",
     host: str = "192.168.11.244",
     port: int = 7648,
-    exp_name: str = "rolling_csi300_lgbm",
+    exp_name: str = "rolling_csi300_lgbm_ndrop1",
     skip_train: bool = False,
     sync: bool = True,
     sync_only: bool = False,
     dry_run: bool = False,
     invest_ratio: float = 0.95,
+    skip_update: bool = False,
 ):
     steps = []
 
@@ -81,10 +86,13 @@ def main(
         return
 
     # ---- Step 1: Update data ----
-    step_header(1, "Update qlib data from baostock")
-    ok = run([sys.executable, "update_baostock.py"], "update_baostock")
-    if not ok:
-        print("WARNING: Data update failed. Continuing anyway...")
+    if not skip_update:
+        step_header(1, "Update qlib data from baostock")
+        ok = run([sys.executable, "update_baostock.py"], "update_baostock", timeout=600)
+        if not ok:
+            print("WARNING: Data update failed/timed out. Continuing anyway...")
+    else:
+        step_header(1, "Update qlib data from baostock (SKIPPED by --skip-update)")
 
     # ---- Step 2: Rolling backtest ----
     step_header(2, "Rolling backtest")
