@@ -223,6 +223,13 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **定时任务**: 244 上已设 2 个 Windows 任务 — `QlibUpdateData` (每晚 21:00, update_data_only.ps1) + `QlibDailyFull` (每早 9:30, run_daily.ps1 完整回测+下单)。**2026-08-02 起 QlibDailyFull 已禁用** (观察期手动 sync); **08-04 事故后再次禁用** (QlibDailyFull 曾于 08-03 被重新启用, 08-04 09:30 因 position.py 非确定 bug 错单, 现已禁用防再错)
 - **部署方式 (2026-08-04 起, 用 git 不用 patch/tar)**: 本仓库 fork 为 `congt` (github.com/tiancongfree/qlib), 分支 `snapshot/rolling_csi300`。**所有代码改动走本机 commit → push 到 congt → 244 `git pull`**。严禁手动 patch/tar 同步 (见 3b 事故教训)。244 pull 后需注意: 若 position.py 有 sort patch 但 git 显示 clean, 说明已含在历史 commit (b5ec5b21) 中; 部署 qlib 源码改动后 244 需重装 `.venv` 中对应包或确认 import 用本地源码
 - **244 同步流程**: `git remote add congt https://github.com/tiancongfree/qlib.git` → `git fetch congt` → `git checkout snapshot/rolling_csi300` → `git pull congt snapshot/rolling_csi300`。数据/缓存 (18GB pkl、mlruns 实验) 仍单独同步, 不入 git
+- **244 无法访问 GitHub 时 (被墙, 2026-08-04 已验证)**: 用 `git bundle` 离线传输增量 commit, 保留 git 历史与 commit:
+  1. 本机打包增量: `git bundle create /tmp/rolling_csi300.bundle <244当前HEAD>..snapshot/rolling_csi300` (109KB/13 commits)
+  2. scp 到 244 (上传到 Windows 家目录, 再 `cp /mnt/c/Users/tc/rolling_csi300.bundle /tmp/`)
+  3. 244 上: `git fetch /tmp/rolling_csi300.bundle snapshot/rolling_csi300 && git merge --ff-only FETCH_HEAD`
+  4. 若报 untracked 文件冲突 (tar 包遗留的 rolling_csi300 文件未 track): 先把冲突文件 `mv` 到备份, merge 后再核对 (已验证 18 个备份文件全在 git 中, 无丢失), 最后删除备份
+  5. 验证: `git log --oneline -1` 应为最新 commit; 关键文件 md5 与本机一致 (`position.py` sort、`custom_handler.py` 无 volume、`run_workflow.py` exp_name=ndrop1)
+  - **后续代码改动仍走 本机 commit → congt → (GitHub 通时 pull / 被墙时 bundle)**
 - **run_workflow.py 默认 exp_name**: 已改为生产实验 `rolling_csi300_lgbm_ndrop1` (勿再改回 `rolling_csi300_lgbm` — 那是旧实验, 历史持仓轨迹不同)
 - **部署包 (已废弃)**: 旧方式 `rolling_csi300_install.tar.gz` (代码+配置+3个核心mlruns实验, 不含18GB缓存pkl), 覆盖解压到 244 的 examples/rolling_csi300/ — **不再使用, 仅备份参考**
 - **244 桌面残留**: rolling_csi300_install.tar.gz (备份, 可删)
