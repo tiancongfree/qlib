@@ -315,6 +315,36 @@ class Alpha158Industry(Alpha158):
         return fields, names
 
 
+class Alpha158Earnings(Alpha158Industry):
+    """Alpha158Industry + earnings-momentum / surprise factors.
+
+    Adds cross-period-stable earnings factors (validated by IC analysis:
+    positive IC in EVERY year 2020-2026, no style-beta like dvratio):
+      NP_ACCEL    = netprofit_yoy - lag1(netprofit_yoy)   (earnings acceleration)
+      QPROF_ACCEL = q_profit_yoy - lag1(q_profit_yoy)     (single-quarter profit momentum)
+
+    Both are precomputed daily bins (ffill from announcement dates, no lookahead)
+    -> fast rolling builds.  Rejected factors (roe_chg / margin_chg / eps_yoy had
+    negative IC in 2022-2023, i.e. style-cyclical) are intentionally NOT included.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def get_feature_config(self):
+        fields, names = super().get_feature_config()
+
+        earnings_fields = [
+            ("$np_accel", "NP_ACCEL"),
+            ("$qprof_accel", "QPROF_ACCEL"),
+        ]
+        for expr, name in earnings_fields:
+            fields += [expr]
+            names += [name]
+
+        return fields, names
+
+
 class DvRatioProcessor(Processor):
     """Robust preprocessing for 分红融资比 (dividend/financing ratio) features.
 
