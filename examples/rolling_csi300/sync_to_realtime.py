@@ -56,19 +56,36 @@ def load_target_positions(exp_name: str, last_positions_csv: str = None) -> pd.D
     return save_last_day_positions(exp_name=exp_name)
 
 
-def get_actual_holdings(client: TradeClient) -> dict:
-    """Query current holdings from easyths, return {stock_code: shares}."""
+def get_actual_holdings(client: TradeClient) -> dict | None:
+    """Query current holdings from easyths, return {stock_code: shares}.
+
+    Returns ``None`` when the query itself failed or returned a payload that
+    cannot be trusted (e.g. easyths reported success=True but parsed an empty
+    broker response into an empty DataFrame — a known failure mode that must
+    NOT be mistaken for a genuinely empty account, otherwise sync would
+    re-buy every held stock).  An empty ``{}`` is only returned for a
+    verifiably empty account (no holdings payload at all).
+    """
     result = client.query_holdings(return_type="json")
     if not result.get("success"):
         print(f"ERROR: Failed to query holdings: {result.get('message')}")
-        return {}
+        return None
     data = result.get("data", {})
     # data can be either {"holdings": [...]} or a list directly
     if isinstance(data, list):
         holdings_list = data
     elif isinstance(data, dict):
-        holdings_list = data.get("holdings", data.get("data", []))
-        if not holdings_list:
+        if "holdings" in data or "data" in data:
+            holdings_list = data.get("holdings", data.get("data", []))
+        elif not data:
+            # Empty dict with no holdings/data key: easyths reported success=True
+            # but failed to parse the broker response into a DataFrame (e.g.
+            # "No columns to parse from file" -> holding={}).  This is NOT a
+            # trustworthy empty account -> treat as query failure.
+            print("ERROR: Holdings payload empty/unparseable (easyths parsed an empty "
+                  "broker response as success=True). Refusing to treat as empty account.")
+            return None
+        else:
             holdings_list = data
     else:
         holdings_list = []
@@ -355,6 +372,7 @@ def main(
     dry_run: bool = True,
     invest_ratio: float = 0.95,
     price_slippage: float = 0.002,
+    allow_empty_holdings: bool = False,
 ):
     print("=" * 60)
     print("  Qlib → EasyTHS Real-time Sync")
@@ -451,6 +469,21 @@ def main(
         print(f"  Cash reserve: 400000.00 -> target portfolio: {max_total:.2f}")
 
         actual = get_actual_holdings(client)
+        if actual is None:
+            print("ERROR: Holdings query failed. Aborting sync to avoid placing orders "
+                  "on an unknown account state (would re-buy every target stock).")
+            sys.exit(1)
+        if not actual and not allow_empty_holdings:
+            print("=" * 60)
+            print("  SAFETY GUARD: holdings query returned EMPTY account.")
+            print("  This is usually a transient easyths/broker failure (the broker")
+            print("  returned empty text and easyths parsed it into an empty DataFrame")
+            print("  while still reporting success=True), NOT a genuinely empty account.")
+            print("  Proceeding would re-buy every target stock (duplicate orders).")
+            print("  ABORTING. If the account is truly empty (first-time setup), re-run")
+            print("  with --allow-empty-holdings True to force it through.")
+            print("=" * 60)
+            sys.exit(1)
         print(f"  Current holdings: {len(actual)} stocks")
 
         if not dry_run:
