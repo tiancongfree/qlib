@@ -101,6 +101,45 @@ def build_existing_last_values(stock_list, calendar):
     return results
 
 
+def _query_stock_timeout(bs_sym: str, start: str, end: str, per_stock_timeout: float = 30):
+    """Query one stock's k-data with a per-stock wall-clock timeout.
+
+    baostock's ``query_history_k_data_plus`` is a blocking call that can hang
+    indefinitely when the server is unstable (observed 2026-08: the whole
+    update stalled on a single stock until the outer 600s timeout killed it).
+    Run the query + row-drain in a thread and abandon it if it exceeds the
+    timeout, so one bad stock can no longer stall the entire update.
+
+    Returns the ``rs`` result object on success, or ``None`` on timeout.
+    """
+    import threading
+
+    result = {}
+
+    def _run():
+        try:
+            result["rs"] = bs.query_history_k_data_plus(
+                bs_sym,
+                "date,open,high,low,close,volume,amount,preclose,pctChg",
+                start_date=start,
+                end_date=end,
+                frequency="d",
+                adjustflag="2",
+            )
+        except Exception as e:
+            result["exc"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(per_stock_timeout)
+    if t.is_alive():
+        # Abandon this thread (daemon); connection is poisoned, caller re-logins.
+        return None
+    if "exc" in result:
+        raise result["exc"]
+    return result.get("rs")
+
+
 def download(stock_list, start, end):
     """Download baostock data for all stocks."""
     lg = bs.login()
@@ -115,6 +154,7 @@ def download(stock_list, start, end):
     all_data = []
     total = len(stock_list)
     fail = 0
+    timeout = 0
     chunk = 200
     for i in range(0, total, chunk):
         batch = stock_list[i : i + chunk]
@@ -124,14 +164,20 @@ def download(stock_list, start, end):
             print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
             try:
                 # adjustflag=2: forward-adjusted (all prices at current level)
-                rs = bs.query_history_k_data_plus(
-                    bs_sym,
-                    "date,open,high,low,close,volume,amount,preclose,pctChg",
-                    start_date=start,
-                    end_date=end,
-                    frequency="d",
-                    adjustflag="2",
-                )
+                rs = _query_stock_timeout(bs_sym, start, end, per_stock_timeout=30)
+                if rs is None:
+                    timeout += 1
+                    fail += 1
+                    print(" TIMEOUT(skip)", flush=True)
+                    # A hung socket poisons the baostock session; re-login to recover.
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
+                    lg = bs.login()
+                    if lg.error_code != "0":
+                        raise RuntimeError(f"baostock re-login failed: {lg.error_msg}")
+                    continue
                 if rs.error_code != "0":
                     fail += 1
                     print(" FAIL", flush=True)
@@ -150,12 +196,12 @@ def download(stock_list, start, end):
                 fail += 1
                 print(" ERROR", flush=True)
         progress = min(i + chunk, total)
-        print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed)", flush=True)
+        print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out)", flush=True)
         time.sleep(0.3)
     bs.logout()
     if not all_data:
         raise RuntimeError(f"No data downloaded ({fail} failures)")
-    print(f"  Downloaded {len(all_data)} stocks, {fail} failures")
+    print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out)")
     return all_data
 
 def read_all_instruments():

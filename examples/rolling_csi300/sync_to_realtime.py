@@ -102,9 +102,26 @@ def get_actual_holdings(client: TradeClient) -> dict | None:
             pos.get("持仓数量", 0) or pos.get("quantity", 0) or
             pos.get("amount", 0)
         )
-        if qty > 0:
+        if qty > 0 and _is_stock(code):
             holdings[_ths_to_qlib(code)] = qty
     return holdings
+
+
+def _is_stock(code: str) -> bool:
+    """Keep only A-share stock codes; exclude bonds, cash funds, repos etc.
+
+    The account may hold non-stock instruments (现金宝 131990, 可转债 113708,
+    etc.).  These must never be treated as positions to buy/sell against the
+    qlib stock target, otherwise sync would emit sell orders for them (or
+    worse, a re-buy).  A-share stock codes: SH 6xxxxx (60x/68x/605/601/603),
+    SZ 0xxxxx (000/001/002/003) and 3xxxxx (300/301).
+    """
+    c = str(code).strip()
+    if not c.isdigit() or len(c) > 6:
+        return False
+    c = c.zfill(6)
+    return c.startswith(("600", "601", "603", "605", "688", "689",
+                         "000", "001", "002", "003", "300", "301"))
 
 
 def _to_lots(shares: float) -> int:
