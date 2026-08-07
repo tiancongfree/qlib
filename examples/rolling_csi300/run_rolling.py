@@ -31,6 +31,7 @@ from save_positions import save_positions_to_csv
 # Register custom classes so subprocesses can deserialize them
 add_safe_class("custom_handler", "Alpha158Momentum")
 add_safe_class("custom_handler", "Alpha158Industry")
+add_safe_class("custom_handler", "Alpha158Earnings")
 add_safe_class("custom_handler", "IndustryProcessor")
 add_safe_class("custom_handler", "DvRatioProcessor")
 add_safe_class("custom_handler", "Alpha158DvRatio")
