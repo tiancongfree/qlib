@@ -205,6 +205,202 @@ class ICTimingStrategy(TopkDropoutStrategy):
         return super().generate_trade_decision(execute_result)
 
 
+GLOBAL_TECH_INDUSTRIES = {"C39", "I63", "I64", "I65", "R86", "R87"}
+
+
+class _AdjustSignal:
+    """Wrap a raw signal and adjust the score of per-instrument codes by a weight.
+
+    ``weights`` maps a lowercase instrument code to an adjustment that is added to the
+    score as ``weight * <daily cross-sectional std of score>``.  Positive weights boost
+    selection (e.g. tilt toward tech), negative weights de-weight selection (e.g. avoid
+    baijiu/white-liquor).  Storing weights in units of one daily cross-sectional std
+    keeps the adjustment effective across regimes where the raw score scale changes
+    drastically (e.g. the post-2025-09 clustered-score regime).
+
+    The wrapper preserves the raw DataFrame/Series shape so downstream code
+    (TopkDropout selection, ICTiming) handles it identically.
+    """
+
+    def __init__(self, base_signal, weight_map, scale_name=None):
+        self._base = base_signal
+        self._w = weight_map  # Dict[str, float], keys lowercase instrument
+        self._scale_name = scale_name
+
+    def get_signal(self, start_time, end_time):
+        raw = self._base.get_signal(start_time=start_time, end_time=end_time)
+        if raw is None:
+            return raw
+        if isinstance(raw, pd.DataFrame):
+            score = raw.iloc[:, 0]
+        else:
+            score = raw
+        # pairing factor per instrument (weight in units of daily cross-sectional std)
+        factor = score.index.map(lambda c: self._w.get(str(c).lower(), 0.0))
+        inst_level = score.index.nlevels - 1 if score.index.nlevels else 0
+        if score.index.nlevels >= 2:
+            # multi-day: daily cross-sectional std by day (level 0 = datetime)
+            grp = score.groupby(level=0).transform("std")
+        else:
+            # single-day snapshot: whole cross-section
+            grp = pd.Series(score.std(), index=score.index)
+        adj = score + factor * grp
+        if isinstance(raw, pd.DataFrame):
+            out = raw.copy()
+            out.iloc[:, 0] = adj.values
+        else:
+            out = adj
+        return out
+
+
+class _TiltedSignal(_AdjustSignal):
+    """Back-compat wrapper; single tech-code set + single tilt (see _AdjustSignal)."""
+
+    def __init__(self, base_signal, tech_codes, tilt):
+        super().__init__(base_signal, {c: float(tilt) for c in tech_codes})
+
+
+class TechTiltICTimingStrategy(ICTimingStrategy):
+    """ICTimingStrategy (IC-based de-risking) + tech-industry tilt in stock selection.
+
+    De-risking uses the RAW (untilted) IC so the tilt never biases the timing signal.
+    Only the stock selection ranking is tilted toward tech names.
+    """
+
+    def __init__(
+        self,
+        *,
+        tilt=1.0,
+        tech_industries=None,
+        industry_map_path=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        base_signal = self.signal
+        if tech_industries is None:
+            tech_industries = GLOBAL_TECH_INDUSTRIES
+        tech_prefixes = tuple(sorted(set(tech_industries)))
+        if industry_map_path is None:
+            industry_map_path = Path(__file__).parent / "industry_map.pkl"
+        with open(industry_map_path, "rb") as f:
+            industry_map = pickle.load(f)
+        self._tech_codes = {
+            code.lower() for code, ind in industry_map.items() if str(ind).startswith(tech_prefixes)
+        }
+        self._raw_signal = base_signal
+        self._tilted_signal = _TiltedSignal(base_signal, self._tech_codes, float(tilt))
+        # Route stock-selection reads through the tilted signal.  We keep the raw
+        # signal reference for IC computation (see _precompute_ic override).
+        self._base_meta = type(self._tilted_signal)
+        self.signal = self._tilted_signal
+
+    def _precompute_ic(self):
+        # Compute IC from the UNTILTED signal so tilt does not pollute the timing.
+        saved = self.signal
+        self.signal = self._raw_signal
+        try:
+            super()._precompute_ic()
+        finally:
+            self.signal = saved
+
+
+class IndustryAdjustStrategy(ICTimingStrategy):
+    """ICTimingStrategy + arbitrary per-industry score adjustment in stock selection.
+
+    Unlike TechTiltICTimingStrategy (single tilt for one code set), this builds a
+    code->weight map from a list of (industry-prefix or explicit code, weight) rules:
+
+      - weight > 0 : boost selection (score += weight * daily_std)
+      - weight < 0 : de-weight selection (score -= |weight| * daily_std)
+
+    De-risking still uses the RAW (unadjusted) IC so the adjustment never biases the
+    timing signal.  ``baijiu`` de-weight is the motivating use case: baijiu stocks sit
+    inside C15 (酒、饮料和精制茶) together with beer/soft-drink/tea, so they need an
+    explicit whitelist (see ``BAIJIU_CODES``) rather than an industry prefix.
+
+    Parameters
+    ----------
+    weight_rules : list of tuples
+        Each item is ``(key, weight)`` where ``key`` is either an industry prefix
+        (matched against the industry_map value, e.g. ``"C39"``) or an exact lowercase
+        instrument code (e.g. ``"sh600519"``).  ``weight`` in units of daily std.
+    baijiu_codes : iterable of str
+        Explicit whitelist of baijiu instrument codes (lowercase).  Convenience alias
+        that appends each code with its weight to the rules.  If given, ``baijiu``
+        de-weighting is applied regardless of C15 composition.
+    baijiu_weight : float
+        Weight applied to each ``baijiu_codes`` entry (default -0.5 => de-weight).
+    """
+
+    def __init__(
+        self,
+        *,
+        weight_rules=None,
+        baijiu_codes=None,
+        baijiu_weight=-0.5,
+        industry_map_path=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        base_signal = self.signal
+        if baijiu_codes is None:
+            baijiu_codes = BAIJIU_CODES  # default: de-weight the whole baijiu whitelist
+        if industry_map_path is None:
+            industry_map_path = Path(__file__).parent / "industry_map.pkl"
+        with open(industry_map_path, "rb") as f:
+            industry_map = pickle.load(f)
+        weight_map = {}
+        for key, weight in (weight_rules or []):
+            if key.lower().startswith(("sh", "sz")):
+                weight_map[key.lower()] = float(weight)
+            else:
+                prefix = str(key)
+                for code, ind in industry_map.items():
+                    if str(ind).startswith(prefix):
+                        weight_map[code.lower()] = float(weight)
+        if baijiu_codes is not None:
+            for code in baijiu_codes:
+                weight_map[str(code).lower()] = float(baijiu_weight)
+        self._raw_signal = base_signal
+        self._adjust_signal = _AdjustSignal(base_signal, weight_map)
+        self._base_meta = type(self._adjust_signal)
+        self.signal = self._adjust_signal
+
+    def _precompute_ic(self):
+        saved = self.signal
+        self.signal = self._raw_signal
+        try:
+            super()._precompute_ic()
+        finally:
+            self.signal = saved
+
+
+# 白酒 (white-liquor) 证券代码白名单, 用于单独降权 (区别于 C15 中的啤酒/饮料/茶)
+BAIJIU_CODES = [
+    "sh600519",  # 贵州茅台
+    "sz000858",  # 五粮液
+    "sz000568",  # 泸州老窖
+    "sz002304",  # 洋河股份
+    "sh600809",  # 山西汾酒
+    "sz000596",  # 古井贡酒
+    "sh603369",  # 今世缘
+    "sh600779",  # 水井坊
+    "sh603589",  # 口子窖
+    "sz000799",  # 酒鬼酒
+    "sh600702",  # 舍得酒业
+    "sh600559",  # 老白干酒
+    "sz000860",  # 顺鑫农业
+    "sh600197",  # 伊力特
+    "sh603198",  # 迎驾贡酒
+    "sz000995",  # 皇台酒业
+    "sh600616",  # 金枫酒业
+    "sz002646",  # 天佑德酒
+    "sh600238",  # 海南椰岛
+    "sh600199",  # 金种子酒
+    "sz603919",  # 金徽酒
+]
+
+
 class IndustryProcessor(Processor):
     """Add industry-relative features (industry mean, excess, rank)."""
 
