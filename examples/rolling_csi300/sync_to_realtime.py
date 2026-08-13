@@ -477,13 +477,10 @@ def main(
             sys.exit(1)
         print(" OK", flush=True)
         total_assets = float(funds["data"].get("总资产", 0))
-        # 固定现金垫方案 (分批建仓阶段, 2026-08-04): 保留 40w 现金垫, 其余投入目标组合。
-        # 相比 `total_assets * invest_ratio`: 比例方案会随盈利把 scale 拉回固定比例,
-        # 导致盈利部分被强制兑现 (稀释); 固定垫方案让超出现金垫的部分自然跟涨, 不稀释。
-        #  现金垫 40w → 400000 | 现金垫 20w → 200000 | 最终投满 → total_assets * invest_ratio
-        max_total = max(0.0, total_assets - 400000)
+        # 全部资产投入 (2026-08-13): 已清仓, 转入模拟盘观察, 不再保留现金垫。
+        max_total = total_assets
         print(f"  Account total assets: {total_assets:.2f}")
-        print(f"  Cash reserve: 400000.00 -> target portfolio: {max_total:.2f}")
+        print(f"  Invest all: -> target portfolio: {max_total:.2f}")
 
         actual = get_actual_holdings(client)
         if actual is None:
