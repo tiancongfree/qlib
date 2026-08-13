@@ -426,3 +426,22 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - (可选) IC 长期失效监控与自动暂停机制 — 已在 ICTiming 内降仓, 极端情况需暂停
 - (可选) 更高频/另类信号源 (分钟级) — 机构暴力来源, 需新数据
 - (可选) 减少训练窗口减轻 swap 依赖
+
+## 回撤邮件提醒 (dd_alert.py, 2026-08-13)
+
+### 功能
+- **语义**: 策略回撤 (按**全历史峰值** `cum_return/cummax-1` 算, 取末值) 每新突破一个 5% 档位 (5%→10%→15%…) 发一封简单中文邮件; 同一档位不重复 (跨天持久化)
+- **数据源**: 回测权益曲线 `report_normal_1day.pkl` (实验 `rolling_csi300_lgbm`, 复用 analyze_equity_curve.py 找最新 recorder 逻辑)
+- **状态文件**: `examples/rolling_csi300/dd_alert_state.json`, 存 `{"last_tier": n}`; 回撤恢复后再次加深到更高档才发
+- **邮件**: `send_email.py` (QQ SMTP-LL 465), 纯文本 body (当前回撤/档位/数据截至日), 无 HTML/附件
+- **集成**: `run_daily.ps1` 在 equity curve 分析后调用 `dd_alert.py --exp_name rolling_csi300_lgbm` (成功分支+重启后分支都加了)
+
+### EMAIL_PASSWORD 获取 (关键)
+- 密码存在 **244 Windows 用户环境变量 `EMAIL_PASSWORD`** (backtrader 项目 bat 也是靠它, 故邮件可正常发)
+- **WSL 读不到** Windows 用户环境变量 (WSLENV 桥接不可靠); `dd_alert.py` 用 `_ensure_email_password()` 兜底 — 优先取 WSL env, 否则 `cmd.exe /c echo %EMAIL_PASSWORD%` 经由 Windows interop 读 Windows 用户环境变量 (已测 244 上 len=16 解析成功)
+- 已设 Windows 用户 `WSLENV=EMAIL_PASSWORD/U` (计划内桥接, 但不依赖它); 本机研究机跑 dd_alert 时需自行设 `EMAIL_PASSWORD` env
+
+### 已测
+- 档位逻辑: run1 触发→state=5; run2 去重不重复发; 复原不改档不发; 加深触发 (本地 monkeypatch 验证)
+- 生产 dry-run: report end 2026-07-31, 当前回撤 0%, 正确不发
+- 244 端到端: 强制 -14% 回撤 → "邮件发送成功！" + state 写入 last_tier=2 → **实际邮件已发送成功**

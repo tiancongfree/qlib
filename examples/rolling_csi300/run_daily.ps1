@@ -159,6 +159,7 @@ if ($RestartCmd) {
 $wslCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath run_workflow.py --api-key '$ApiKey' --skip-train --sync=True --invest-ratio $InvestRatio $extraArgs; echo __EXIT__`$?"
 $icDecayCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath analyze_ic_decay.py --exp_name rolling_csi300_lgbm --freq quarterly --output_dir /home/tc/qlib/examples/rolling_csi300; echo __EXIT__`$?"
 $equityCurveCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath analyze_equity_curve.py --exp_name rolling_csi300_lgbm; echo __EXIT__`$?"
+$ddAlertCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath dd_alert.py --exp_name rolling_csi300_lgbm; echo __EXIT__`$?"
 
 Write-Log "Running: $($wslCmd -replace [regex]::Escape($ApiKey), '****')"
 
@@ -194,6 +195,17 @@ if ($exitCode -eq 0) {
         $line = $_ -replace "`r", ""
         if ($line -match '__EXIT__(\d+)') {
             Write-Log "Equity curve analysis exit code: $([int]$Matches[1])"
+        } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
+            [Console]::WriteLine($line)
+            Add-Content -Path $logFile -Value $line -Encoding UTF8
+        }
+    }
+    # Run drawdown alert; emails when a new 5% drawdown tier is crossed.
+    Write-Log "Running drawdown alert..."
+    wsl -u tc bash -c $ddAlertCmd 2>&1 | ForEach-Object {
+        $line = $_ -replace "`r", ""
+        if ($line -match '__EXIT__(\d+)') {
+            Write-Log "Drawdown alert exit code: $([int]$Matches[1])"
         } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
             [Console]::WriteLine($line)
             Add-Content -Path $logFile -Value $line -Encoding UTF8
@@ -235,6 +247,17 @@ if ($exitCode -eq 0) {
                 $line = $_ -replace "`r", ""
                 if ($line -match '__EXIT__(\d+)') {
                     Write-Log "Equity curve analysis exit code: $([int]$Matches[1])"
+                } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
+                    [Console]::WriteLine($line)
+                    Add-Content -Path $logFile -Value $line -Encoding UTF8
+                }
+            }
+            # Run drawdown alert; emails when a new 5% drawdown tier is crossed.
+            Write-Log "Running drawdown alert..."
+            wsl -u tc bash -c $ddAlertCmd 2>&1 | ForEach-Object {
+                $line = $_ -replace "`r", ""
+                if ($line -match '__EXIT__(\d+)') {
+                    Write-Log "Drawdown alert exit code: $([int]$Matches[1])"
                 } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
                     [Console]::WriteLine($line)
                     Add-Content -Path $logFile -Value $line -Encoding UTF8
