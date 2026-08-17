@@ -29,6 +29,7 @@ import pandas as pd
 from qlib import auto_init
 from easyths import TradeClient, TradeClientError
 
+from auction_factors import compute_tencent_approx_factors, fetch_tencent_snapshot
 from save_positions import save_last_day_positions
 
 API_KEY_ENV = "EASYTHS_API_KEY"
@@ -132,52 +133,15 @@ def _to_lots(shares: float) -> int:
 _QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
 
 def _load_real_prices(instruments: list) -> dict:
-    """Query current real-time prices from Tencent quote API.
+    """Query current real-time prices from Tencent quote API (batched).
 
-    Returns {qlib_code: current_price}. Much faster and more reliable than
-    baostock (which needs a login session and hangs when the server is down).
-    Batch query is supported (comma-separated codes), so 30 stocks = 1 request.
+    Thin wrapper over :func:`fetch_tencent_snapshot`, returning only
+    {qlib_code: current_price}. Batch query: <=50 codes per HTTP request.
     """
-    import urllib.request
-
-    def _tencent_code(inst: str) -> str:
-        ex = inst[:2].lower()
-        return f"{ex}{inst[2:]}"
-
-    prices = {}
-    codes = [_tencent_code(c) for c in instruments]
-    if not codes:
-        return prices
-    # Batch in chunks of 50
-    for i in range(0, len(codes), 50):
-        chunk = codes[i : i + 50]
-        url = "https://qt.gtimg.cn/q=" + ",".join(chunk)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            data = urllib.request.urlopen(req, timeout=10).read().decode("gbk")
-            for line in data.strip().split(";"):
-                parts = line.split("~")
-                if len(parts) > 4:
-                    # parts[2]=code, parts[3]=current price
-                    sym = parts[2]
-                    try:
-                        price = float(parts[3])
-                    except ValueError:
-                        continue
-                    if price > 0:
-                        # map back to qlib code: tencent returns 6-digit sym without
-                        # market prefix, but we requested ex+sym, so rebuild from the
-                        # request code (codes list) rather than parsing parts[2].
-                        qlib_code = None
-                        for _q in chunk:
-                            if _q[2:] == sym:
-                                qlib_code = _q.upper()
-                                break
-                        if qlib_code:
-                            prices[qlib_code] = price
-        except Exception:
-            continue
-    return prices
+    return {
+        inst: s["price"] for inst, s in fetch_tencent_snapshot(instruments).items()
+        if s.get("price", 0) > 0
+    }
 
 
 def _load_factor(inst: str, end_date: str = None) -> float:
@@ -203,10 +167,19 @@ def _load_factor(inst: str, end_date: str = None) -> float:
     return None
 
 
-def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
+def _parse_target_stocks(
+    target: pd.DataFrame,
+    max_total: float = None,
+    snapshot: dict = None,
+) -> dict:
     result = {}
     instruments = [idx[0] for idx in target.index]
-    real_prices = _load_real_prices(instruments)
+    # Reuse an already-fetched snapshot when available (avoids a second HTTP call).
+    if snapshot is None:
+        snapshot = fetch_tencent_snapshot(instruments)
+    real_prices = {
+        inst: s["price"] for inst, s in snapshot.items() if s.get("price", 0) > 0
+    }
 
     # Convert qlib target positions to real shares.
     # qlib stores amount in adjusted (前复权) shares and price in adjusted price.
@@ -245,6 +218,46 @@ def _parse_target_stocks(target: pd.DataFrame, max_total: float = None) -> dict:
     return result
 
 
+def _append_obs_log(
+    obs_log: str,
+    target: pd.DataFrame,
+    cut_codes: list,
+    strengths: dict,
+    retail_sells: dict,
+    pool: set,
+    actual_set: set,
+):
+    """Append one row per candidate stock to the observation CSV.
+
+    Columns: date, code, auction_buy_strength, retail_sell_strength, would_cut,
+    held. Used later to measure the win rate of the would-be filter vs. the
+    actual next-day return of each stock.
+    """
+    if not obs_log:
+        return
+    try:
+        import datetime as _dt
+
+        date = str(target.index[0][1]) if len(target.index) else _dt.date.today()
+        records = []
+        for c in sorted(pool):
+            records.append({
+                "date": date,
+                "code": c,
+                "auction_buy_strength": round(strengths.get(c, 0.0), 4),
+                "retail_sell_strength": round(retail_sells.get(c, 0.0), 4),
+                "would_cut": c in set(cut_codes),
+                "held": c in actual_set,
+            })
+        new_df = pd.DataFrame(records)
+        path = Path(obs_log)
+        header = not path.exists()
+        new_df.to_csv(path, mode="a", header=header, index=False)
+        print(f"  观察日志已追加 {len(records)} 行 → {obs_log}")
+    except Exception as e:  # never let logging break the sync
+        print(f"  WARNING: 观察日志写入失败: {e}")
+
+
 def sync_positions(
     target: pd.DataFrame,
     actual: dict,
@@ -252,9 +265,35 @@ def sync_positions(
     dry_run: bool = True,
     max_total: float = None,
     price_slippage: float = 0.002,
+    auction_filter: bool = False,
+    auction_observe: bool = True,
+    auction_top_cut: int = 5,
+    retail_exempt_threshold: float = None,
+    obs_log: str = None,
 ):
     """
-    Compare target vs actual and place buy/sell orders.
+    Compare target vs actual and place buy/sell orders, with an optional
+    集合竞价(collection-bidding) short-term filter that TRIMS the target list.
+
+    Filter logic (only when auction_filter=True):
+      - candidate pool = all qlib target stocks
+      - rank the pool by auction_buy_strength (ascending), take the bottom
+        ``auction_top_cut`` stocks
+      - retail exemption: a bottom-cut stock whose retail_sell_strength is above
+        ``retail_exempt_threshold`` is EXEMPT (held position kept, new buy kept),
+        because the original article treats heavy retail selling as a contrarian
+        bullish signal
+      - remaining bottom-cut stocks:
+          * if currently held  -> SELL the whole position
+          * if not held        -> skip (no BUY order)
+      - all other target stocks -> normal buy/add/trim
+    qlib's unconditional sells (held but not in target) are unaffected by the filter.
+
+    Observation mode (auction_observe=True): factors are computed and the full
+    "would-cut" decision is PRINTED and appended to ``obs_log`` CSV, but the
+    target list is NOT modified — normal qlib orders are placed regardless.
+    This is meant for collecting win-rate statistics before enabling the filter
+    for real.
 
     Parameters
     ----------
@@ -268,8 +307,67 @@ def sync_positions(
         If True, only print what would be done.
     max_total : float, optional
         Cap total position value. If None, use target total.
+    auction_filter : bool
+        Enable the collection-bidding short-term filter that TRIMS the target
+        list (see above). Default False (not enabled yet).
+    auction_observe : bool
+        Compute/print/log the would-be filter decision WITHOUT applying it.
+        Default True.
+    auction_top_cut : int
+        Number of weakest-factor target stocks to cut from the bottom. Default 5.
+    retail_exempt_threshold : float, optional
+        If set, a bottom-cut stock with retail_sell_strength above this value is
+        exempt from being cut (contrarian bullish). Default None = no exemption.
+    obs_log : str, optional
+        Path to a CSV that observation decisions are appended to (one row per
+        stock per run). Used for post-hoc win-rate statistics.
     """
-    target_stocks = _parse_target_stocks(target, max_total)
+    # ---- One batched Tencent snapshot for everything ----
+    # Fetch real prices AND auction factors in a single batch (<=50 codes per
+    # request) covering all target + actual stocks. Never call the quote API
+    # per-stock, and never fetch twice in one sync run.
+    all_instruments = sorted(set(idx[0] for idx in target.index) | set(actual.keys()))
+    snapshot = fetch_tencent_snapshot(all_instruments)
+
+    # SAFETY GUARD: if the quote API failed (network/ban), parsing target with
+    # an empty snapshot yields an empty target list -> every held stock would
+    # be treated as "qlib removed" and SOLD.  That is a catastrophic mis-order
+    # on a data-source outage, so abort the sync instead.
+    if not snapshot:
+        print("=" * 60)
+        print("  SAFETY GUARD: Tencent quote API returned no snapshot for any "
+              "instrument.")
+        print("  Without real prices the target list cannot be built and every "
+              "held stock would be sold as 'qlib removed'.")
+        print("  ABORTING sync. Re-run when the quote API is reachable.")
+        print("=" * 60)
+        return
+
+    target_stocks = _parse_target_stocks(target, max_total, snapshot=snapshot)
+
+    # Approximate collection-bidding factors from the SAME snapshot.
+    # Computed whenever we need them: real filter (auction_filter) or observation
+    # mode (auction_observe).
+    need_factors = auction_filter or auction_observe
+    auction_factors = pd.DataFrame()
+    strengths = {}
+    retail_sells = {}
+    if need_factors and snapshot:
+        auction_factors = compute_tencent_approx_factors(snapshot)
+        if not auction_factors.empty:
+            for idx, row in auction_factors.iterrows():
+                v = row.get("auction_buy_strength")
+                if pd.notna(v):
+                    strengths[idx] = float(v)
+                r = row.get("retail_sell_strength")
+                if pd.notna(r):
+                    retail_sells[idx] = float(r)
+
+    def _strength(code: str) -> float:
+        return strengths.get(code, 0.0)
+
+    def _retail(code: str) -> float:
+        return retail_sells.get(code, 0.0)
 
     # Target weights {code: weight} for priority ordering of orders.
     # BUY orders are placed heavy-weight first so that if T+1 available cash
@@ -286,8 +384,63 @@ def sync_positions(
     def _weight(code: str) -> float:
         return target_weights.get(code, 0.0)
 
-    target_set = set(target_stocks.keys())
+    target_set_all = set(target_stocks.keys())
     actual_set = set(actual.keys())
+
+    # ---- 集合竞价短线过滤器: 从 target 全集中裁剪弱因子股 ----
+    # candidate pool = all target stocks; sort by auction_buy_strength ASC,
+    # cut the bottom `auction_top_cut` stocks, with retail contrarian exemption.
+    # Guard: when the pool is smaller than the cut count, trim the bottom
+    # (len-1) instead of the whole pool, so a small portfolio never ends up
+    # with zero buys (the strongest candidate is always preserved).
+    # In observation mode the same decision is computed and logged but NOT
+    # applied to the target list.
+    cut_codes = []
+    if need_factors and auction_top_cut > 0 and target_set_all:
+        ranked = sorted(target_set_all, key=lambda c: _strength(c))
+        if len(ranked) > 1 and len(ranked) <= int(auction_top_cut):
+            print(f"  ⚠️ 候选池 {len(ranked)} 只 ≤ 裁剪数 {int(auction_top_cut)}, "
+                  f"为避免组合被裁光, 只裁末 {len(ranked)-1} 只 (保留因子最强 1 只)")
+        n_cut = min(int(auction_top_cut), max(0, len(ranked) - 1)) if len(ranked) > 1 else 0
+        bottom = ranked[:n_cut]
+        mode = "实际裁剪" if auction_filter else "观察模式(不实际裁剪)"
+        print(f"\n  集合竞价短线过滤器 [{mode}]: 候选 {len(target_set_all)} 只, "
+              f"按 auction_buy_strength 升序, 取末 {len(bottom)} 只")
+        print(f"  {'code':<10}{'strength':>10}{'retail':>10}  {'hold?':>6}")
+        for c in ranked:
+            star = "*" if c in set(bottom) else " "
+            print(f"  {star}{c:<9}{_strength(c):>10.2f}{_retail(c):>10.2f}  "
+                  f"{'HOLD' if c in actual_set else 'none':>6}")
+        for c in bottom:
+            exempt = False
+            if retail_exempt_threshold is not None and _retail(c) > retail_exempt_threshold:
+                exempt = True
+            if exempt:
+                print(f"  → {c} 豁免 (retail_sell_strength {_retail(c):.2f} "
+                      f"> {retail_exempt_threshold}, 散户反向看多)")
+                continue
+            cut_codes.append(c)
+            action = "全卖" if c in actual_set else "不下单(无仓)"
+            print(f"  → 裁剪 {c} (strength {_strength(c):.2f}): {action}")
+        if cut_codes:
+            print(f"  裁剪 {len(cut_codes)} 只: {', '.join(sorted(cut_codes))}")
+        else:
+            print("  本次无裁剪")
+        print()
+        # 观察日志: 记录决策到 CSV (无论是否实际裁剪)
+        _append_obs_log(obs_log, target, cut_codes, strengths, retail_sells,
+                        target_set_all, actual_set)
+        # 只有实际裁剪模式才从目标名单中剔除被裁剪的股票
+        if auction_filter:
+            for c in cut_codes:
+                target_stocks.pop(c, None)
+
+    target_set = set(target_stocks.keys())
+
+    def _buy_key(code: str):
+        """BUY order placement key: heavy-weight first (T+1 cash-shortage
+        still buys the big positions first)."""
+        return (-_weight(code), code)
 
     stocks_to_sell = actual_set - target_set
     stocks_to_buy = target_set - actual_set
@@ -295,11 +448,11 @@ def sync_positions(
 
     # Sell: light weight first (absent weights -> plain code sort)
     stocks_to_sell_sorted = sorted(stocks_to_sell, key=lambda c: (_weight(c), c))
-    # Buy: heavy weight first (absent weights -> plain code sort)
-    stocks_to_buy_sorted = sorted(stocks_to_buy, key=lambda c: (-_weight(c), c))
+    # Buy: heavy weight first
+    stocks_to_buy_sorted = sorted(stocks_to_buy, key=_buy_key)
 
     print(f"\n{'=' * 60}")
-    print(f"  Target stocks: {len(target_set)}")
+    print(f"  Target stocks (after filter): {len(target_set)}")
     print(f"  Actual stocks: {len(actual_set)}")
     print(f"  To sell: {len(stocks_to_sell)}")
     print(f"  To buy:  {len(stocks_to_buy)}")
@@ -307,6 +460,14 @@ def sync_positions(
     if dry_run:
         print(f"  >>> DRY RUN - no orders will be placed <<<")
     print(f"{'=' * 60}\n")
+
+    if need_factors and not auction_factors.empty:
+        print("  集合竞价近似因子 (Tencent snapshot, 横截面相对值, 当前已裁剪名单):")
+        show_codes = sorted(set(target_set) | set(stocks_to_sell))
+        show = auction_factors.reindex(show_codes).dropna(how="all").round(4)
+        if not show.empty:
+            print(show.to_string())
+        print()
 
     def _sanitize(text):
         if not isinstance(text, str):
@@ -336,18 +497,22 @@ def sync_positions(
             except TradeClientError as e:
                 print(f"    -> ERROR: {e}", flush=True)
 
-    # Reference prices (real latest close from baostock) for limit orders.
-    # Query both target (buy) and to-sell stocks so sells also get a limit price.
-    price_query_codes = set(target_stocks.keys()) | set(stocks_to_sell)
-    ref_prices = _load_real_prices(list(price_query_codes))
+    # Reference prices for limit orders, from the SAME snapshot (no extra call).
+    ref_prices = {
+        inst: s["price"] for inst, s in snapshot.items() if s.get("price", 0) > 0
+    }
 
     # ---- Sell stocks not in target ----
+    # 已裁剪名单 (实际持有但被因子裁掉的) 单独标注, 便于复盘
+    cut_held = set(cut_codes) & actual_set
     for code in stocks_to_sell_sorted:
         qty = int(actual[code])
         ths = _qlib_to_ths(code)
         rp = ref_prices.get(code) or ref_prices.get(ths)
         # sell slightly below reference to fill; if no price, fall back to market
         limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+        reason = "因子裁剪" if code in cut_held else "qlib调出"
+        print(f"  # 卖出原因: {reason}", flush=True)
         do("SELL", ths, qty, limit_price)
 
     # ---- Buy stocks in target but not in actual ----
@@ -374,6 +539,28 @@ def sync_positions(
             limit_price = round(rp * (1 - price_slippage), 2) if rp else None
             do("SELL-", ths, abs(diff), limit_price)
 
+    # ---- 过滤器决策摘要 (便于复盘) ----
+    if need_factors and cut_codes:
+        held_cut = sorted(cut_held & actual_set)
+        skip_cut = sorted(set(cut_codes) - actual_set)
+        applied = "实际执行" if auction_filter else "仅观察(未执行)"
+        print(f"\n{'=' * 60}")
+        print(f"  集合竞价过滤器决策摘要 [{applied}]:")
+        print(f"    候选(可买 target): {len(target_set_all)} 只, 裁剪 {len(cut_codes)} 只")
+        if held_cut:
+            print(f"    已持仓→全卖: {', '.join(held_cut)}")
+        if skip_cut:
+            print(f"    无仓位→跳过: {', '.join(skip_cut)}")
+        exempted = []
+        if retail_exempt_threshold is not None:
+            for c in sorted(target_set_all):
+                if _retail(c) > retail_exempt_threshold:
+                    exempted.append(c)
+        if exempted:
+            print(f"    豁免(散户反向): {', '.join(exempted)}")
+        print(f"    保留并正常调仓: {len(target_set)} 只")
+        print(f"{'=' * 60}\n")
+
     if dry_run:
         print(f"\n{'=' * 60}")
         print(f"  This was a DRY RUN. Re-run with --dry-run False to execute.")
@@ -390,6 +577,11 @@ def main(
     invest_ratio: float = 0.95,
     price_slippage: float = 0.002,
     allow_empty_holdings: bool = False,
+    auction_filter: bool = False,
+    auction_observe: bool = True,
+    auction_top_cut: int = 5,
+    retail_exempt_threshold: float = None,
+    obs_log: str = None,
 ):
     print("=" * 60)
     print("  Qlib → EasyTHS Real-time Sync")
@@ -403,6 +595,10 @@ def main(
     if target.empty:
         print("ERROR: No target positions found.")
         sys.exit(1)
+
+    # Observation log defaults to a file next to this script unless a path is given.
+    if auction_observe and not obs_log:
+        obs_log = str(Path(__file__).parent / "auction_observe_log.csv")
 
     # Resolve API key: CLI arg > env var
     resolved_key = api_key or os.environ.get(API_KEY_ENV, "")
@@ -507,7 +703,17 @@ def main(
             else:
                 print(f"  No pending orders to cancel or cancel failed: {cancel_result.get('message')}")
 
-        sync_positions(target, actual, client, dry_run=dry_run, max_total=max_total, price_slippage=price_slippage)
+        sync_positions(
+            target, actual, client,
+            dry_run=dry_run,
+            max_total=max_total,
+            price_slippage=price_slippage,
+            auction_filter=auction_filter,
+            auction_observe=auction_observe,
+            auction_top_cut=auction_top_cut,
+            retail_exempt_threshold=retail_exempt_threshold,
+            obs_log=obs_log,
+        )
 
 
 if __name__ == "__main__":

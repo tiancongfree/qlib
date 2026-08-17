@@ -330,6 +330,32 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **baostock 服务端不可用 (2026-08-02 起)**: login 挂起 (Connection reset by peer), 两台机器都如此, 疑似服务端故障; 实时价改用腾讯行情 API (`_load_real_prices`), 数据更新用 `--skip-update` 跳过
 - **max_total 全资产投入方案 (2026-08-13 起, 研究机)**: 实盘已**清仓**, 转入模拟盘观察, **不再保留现金垫**。`sync_to_realtime.py`: `max_total = total_assets` — 全部资产投入目标组合。历史参考 (2026-08-04~08-12 分批建仓固定现金垫 40w): `max_total = max(0.0, total_assets - 400000)`, 相比 `invest_ratio` 避免盈利被强制兑现稀释。max_total 是目标组合市值上限, `_parse_target_stocks` 按 `scale = max_total / 目标总市值` 等比缩放所有股票
 
+### 集合竞价短线增强 (auction_factors.py, 2026-08-17)
+
+- **来源**: 知乎 38812088 回答, 两个因子基于 A股"隔夜弱、日内强"结构性规律, 用 9:20-9:25 不可撤单时段的逐笔委托构造
+- **严格因子 (需 L2 逐笔委托)**: `compute_auction_factors(orders, avg_5d_amount)` 
+  - `auction_buy_strength` = (Σ下单价>卖一价的买单金额 − Σ下单价<买一价的卖单金额) / 过去5日平均日成交额
+  - `retail_sell_strength` = (Σ散户卖单 − Σ散户买单) / 5日均额 (散户反向指标)
+  - 主动方向判定优先价格比较 (ask1/bid1 原文口径), 无价退回 side 字段
+  - 当前无 L2 数据源, 这部分是纯计算函数待接入
+- **腾讯快照近似 (生产可用)**: `fetch_tencent_snapshot` + `compute_tencent_approx_factors`
+  - 批量抓取 (50只/请求), 返回现价/今开/昨收/外盘/内盘/买卖一挂单
+  - `auction_buy_strength ≈ gap*1e4*(1+0.5*(2*bid_ratio-1))`, gap=(今开/昨收-1) 是主信号, 挂单失衡只作同向调幅**不翻转符号** (低开始终弱)
+  - `retail_sell_strength ≈ inner/(outer+inner)-0.5` (内盘占比, 主动卖盘强弱)
+  - ⚠️ 时间口径: gap 用今开/昨收整天不变 (任意时点都是竞价定调); inner/outer 反映抓取时刻累计, 盘中/盘后含义不同
+- **sync_to_realtime 集成 (短线过滤器, 2026-08-17 重构)**: 从"只影响排序顺序的增强"改为**真正切割目标名单的过滤器**
+  - 候选池 = qlib 全部可买 target 股票; 按 auction_buy_strength 升序取末 N (auction_top_cut 默认5)
+  - ⚠️ **小池保护 (重要)**: 候选池 ≤ 裁剪数时只裁末 `len-1`, **始终保留因子最强 1 只**, 避免组合被裁光 → 当天 0 买入/全卖
+  - ⚠️ **SAFETY GUARD (重要)**: 腾讯行情全挂时 (snapshot 为空) **中止 sync**, 不清仓 — 否则 target_stocks 为空会被当"qlib调出"把全部持仓卖光
+  - 末N处理: **已持仓→全卖清仓**; **无仓位→不下单(跳过)**; 其余正常买卖/调仓
+  - **散户豁免** (retail_exempt_threshold): 末N中 retail_sell_strength 超过阈值的豁免裁剪 (散户反向看多, 原文语义)
+  - **qlib 无条件卖出不受影响**: 实际持有但不在 target 的照常全卖
+  - 一次批量快照同时供 实时价+限价单参考价+近似因子
+  - 参数: `--auction-filter False` (**默认关, 只观察, 暂不实际裁剪** — 用户在积累胜率数据后决定是否开启) / `--auction-top-cut 5` / `--retail-exempt-threshold` (默认 None 不豁免)
+  - **观察模式 (auction_observe, 默认 True)**: 算因子 + 完整打印"若开启会裁剪谁"的决策 + 把每日决策 append 到 `auction_observe_log.csv`, 但**不修改目标名单** (正常按 qlib 下单)。唯一目的 = 积累胜率统计样本。CSV 列: date/code/auction_buy_strength/retail_sell_strength/would_cut/held; 日后用下日收益对比 would_cut=True vs False 两组算胜率
+  - **接口防护 (重要)**: 全流程腾讯行情只调**一次**批量快照 (目标+实际持仓合集, ≤50只/请求), 严禁逐股调用 → 防封号。原 `_load_real_prices` 二次调用已合并
+  - **debug 打印 (2026-08-17 加, 因操作者隔日不在场)**: 完整输出因子横截面排序表 (*标末N)、每只裁剪原因 (全卖/跳过/豁免)、卖出原因标注 (因子裁剪 vs qlib调出)、过滤器决策摘要 (候选数/裁剪数/全卖/跳过/豁免/保留数 + [实际执行/仅观察] 标注)
+
 ### 分批建仓方案 (关键变更: 2026-08-13 已清仓转模拟盘, 此方案归档)
 
 - **状态**: 分批建仓阶段已结束。用户 2026-08-13 **清仓实盘, 转入模拟盘观察**, 不再保留现金垫 (去 40w 垫, max_total=total_assets)
