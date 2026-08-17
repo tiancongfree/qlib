@@ -17,6 +17,8 @@ Usage:
 
 import os
 import sys
+import time as _time
+from datetime import datetime as _dt, time as _dtime
 from pathlib import Path
 
 if str(Path(__file__).parent.parent.parent) in sys.path:
@@ -258,6 +260,38 @@ def _append_obs_log(
         print(f"  WARNING: 观察日志写入失败: {e}")
 
 
+def _wait_for_auction_snapshot(wait_until: str = "09:24:30", enabled: bool = True):
+    """Sleep until the 集合竞价不可撤单段末 before grabbing the Tencent snapshot.
+
+    The scheduled daily task starts at 09:19; the preceding rolling backtest +
+    model loading take a couple of minutes, so by the time we reach the snapshot
+    fetch it is usually ~09:21-09:23. The auction factors (gap, bid-balance) are
+    only meaningful when the snapshot is taken inside the 9:20-9:25 non-cancellable
+    window — the opening auction closes at 9:25 and the open price is fixed then.
+    So we wait until ``wait_until`` (default 09:24:30) unless it is already past
+    (manual run / after-market / non-trading day → snapshot fetched immediately).
+
+    Only sleeps when the current time is between 09:00 and ``wait_until``; never
+    across midnight or on days where the clock has already passed the target.
+    """
+    if not enabled or not wait_until:
+        return
+    try:
+        now = _dt.now()
+        h, m, s = (int(x) for x in wait_until.split(":"))
+        target = now.replace(hour=h, minute=m, second=s, microsecond=0)
+        if now < target and now.hour >= 9:
+            delay = (target - now).total_seconds()
+            print(f"\n  集合竞价等待: 当前 {now:%H:%M:%S}, 等待 {delay:.0f}s 至 "
+                  f"{wait_until} (9:20-9:25 不可撤单段末) 再抓快照...", flush=True)
+            _time.sleep(delay)
+            print(f"  已到 {wait_until}, 开始抓取腾讯快照。", flush=True)
+        else:
+            print(f"  当前 {now:%H:%M:%S} 已过 {wait_until}, 不等待直接抓快照。", flush=True)
+    except Exception as e:
+        print(f"  WARNING: 集合竞价等待失败, 直接抓快照: {e}", flush=True)
+
+
 def sync_positions(
     target: pd.DataFrame,
     actual: dict,
@@ -270,6 +304,8 @@ def sync_positions(
     auction_top_cut: int = 5,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
+    auction_wait_until: str = "09:24:30",
+    auction_wait: bool = True,
 ):
     """
     Compare target vs actual and place buy/sell orders, with an optional
@@ -321,7 +357,17 @@ def sync_positions(
     obs_log : str, optional
         Path to a CSV that observation decisions are appended to (one row per
         stock per run). Used for post-hoc win-rate statistics.
+    auction_wait_until : str
+        Wall-clock time (HH:MM:SS) to wait for before fetching the Tencent
+        snapshot. Default "09:24:30" = end of the 9:20-9:25 non-cancellable
+        auction window. See :func:`_wait_for_auction_snapshot`.
+    auction_wait : bool
+        Enable the wait. Default True (scheduled runs start 09:19; the snapshot
+        must be taken inside the auction window for the factors to be valid).
     """
+    # Wait for the auction window to be over before fetching real-time quotes.
+    _wait_for_auction_snapshot(auction_wait_until, enabled=auction_wait)
+
     # ---- One batched Tencent snapshot for everything ----
     # Fetch real prices AND auction factors in a single batch (<=50 codes per
     # request) covering all target + actual stocks. Never call the quote API
@@ -582,6 +628,8 @@ def main(
     auction_top_cut: int = 5,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
+    auction_wait_until: str = "09:24:30",
+    auction_wait: bool = True,
 ):
     print("=" * 60)
     print("  Qlib → EasyTHS Real-time Sync")
@@ -713,6 +761,8 @@ def main(
             auction_top_cut=auction_top_cut,
             retail_exempt_threshold=retail_exempt_threshold,
             obs_log=obs_log,
+            auction_wait_until=auction_wait_until,
+            auction_wait=auction_wait,
         )
 
 

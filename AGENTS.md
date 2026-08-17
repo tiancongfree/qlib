@@ -355,6 +355,7 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
   - **观察模式 (auction_observe, 默认 True)**: 算因子 + 完整打印"若开启会裁剪谁"的决策 + 把每日决策 append 到 `auction_observe_log.csv`, 但**不修改目标名单** (正常按 qlib 下单)。唯一目的 = 积累胜率统计样本。CSV 列: date/code/auction_buy_strength/retail_sell_strength/would_cut/held; 日后用下日收益对比 would_cut=True vs False 两组算胜率
   - **接口防护 (重要)**: 全流程腾讯行情只调**一次**批量快照 (目标+实际持仓合集, ≤50只/请求), 严禁逐股调用 → 防封号。原 `_load_real_prices` 二次调用已合并
   - **debug 打印 (2026-08-17 加, 因操作者隔日不在场)**: 完整输出因子横截面排序表 (*标末N)、每只裁剪原因 (全卖/跳过/豁免)、卖出原因标注 (因子裁剪 vs qlib调出)、过滤器决策摘要 (候选数/裁剪数/全卖/跳过/豁免/保留数 + [实际执行/仅观察] 标注)
+  - **集合竞价抓取定时 (2026-08-17 加)**: 定时任务 09:19 启动, 回测+加载模型到抓快照通常 09:21-23。因子 (gap/挂单失衡) 只在 9:20-9:25 不可撤单段才有意义 → 抓快照前 `_wait_for_auction_snapshot` sleep 到 `--auction-wait-until` (默认 `09:24:30`) 再批量抓。仅在 [09:00, wait_until) 时段等待, 过点/盘后/手动补跑不等待 (不会跨午夜)。`--auction-wait False` 可关
 
 ### 分批建仓方案 (关键变更: 2026-08-13 已清仓转模拟盘, 此方案归档)
 
