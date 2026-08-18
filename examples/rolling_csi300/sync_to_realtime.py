@@ -127,9 +127,25 @@ def _is_stock(code: str) -> bool:
                          "000", "001", "002", "003", "300", "301"))
 
 
-def _to_lots(shares: float) -> int:
-    """Round shares down to nearest 100 (1 lot = 100 shares for A-shares)."""
-    return max(0, int(shares / 100) * 100)
+def _lot_size(code: str) -> int:
+    """Minimum order lot (shares) for a stock.
+
+    Main board / ChiNext: 100; STAR Market (科创板, 688/689): 200.
+    Buy orders must be in multiples of the lot size (科创板 单笔买入须 ≥200 股,
+    超出部分可按 1 股递增; 主板单笔须为 100 整数倍).
+    """
+    c = str(code).strip()[-6:]
+    return 200 if c.startswith(("688", "689")) else 100
+
+
+def _to_lots(shares: float, code: str = "") -> int:
+    """Round shares down to the nearest lot size (100 or 200 for 科创板).
+
+    Returns 0 when the position is smaller than one lot (a sub-200 科创板
+    holding cannot be bought up to a valid lot, so it is skipped here).
+    """
+    lot = _lot_size(code)
+    return max(0, int(shares / lot) * lot)
 
 
 _QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
@@ -214,7 +230,7 @@ def _parse_target_stocks(
 
     for instrument, real_shares, value in items:
         scaled_shares = real_shares * scale
-        qty = _to_lots(scaled_shares)
+        qty = _to_lots(scaled_shares, instrument)
         if qty > 0:
             result[instrument] = qty
     return result
@@ -582,11 +598,26 @@ def sync_positions(
         ths = _qlib_to_ths(code)
         rp = ref_prices.get(code) or ref_prices.get(ths)
         if diff > 0:
+            lot = _lot_size(code)
+            if lot > 100 and diff < lot:
+                # 科创板 BUY+: 目标-实际须 ≥200 股才能加仓; 不足则差是历史零头,
+                # 无法补到一个合法 200 倍数, 跳过该加仓 (避免 x100 违规买单)。
+                print(f"  # {code}: BUY+ 差 {diff} 股 < 科创板最小 200 股, 跳过加仓",
+                      flush=True)
+                continue
             limit_price = round(rp * (1 + price_slippage), 2) if rp else None
             do("BUY+", ths, diff, limit_price)
         elif diff < 0:
+            sell_qty = abs(diff)
+            # 科创板 (688/689): 余额不足 200 股时必须一次性全卖, 不能卖出
+            # 一个小于 200 的零头 (卖出申报须 ≥200 股, 零头只能整体清仓)。
+            lot = _lot_size(code)
+            if lot > 100 and sell_qty < lot:
+                print(f"  # {code}: SELL- {sell_qty} 股 < 科创板最小 200 股, "
+                      f"改为全卖剩余 {actual_qty} 股", flush=True)
+                sell_qty = actual_qty
             limit_price = round(rp * (1 - price_slippage), 2) if rp else None
-            do("SELL-", ths, abs(diff), limit_price)
+            do("SELL-", ths, sell_qty, limit_price)
 
     # ---- 过滤器决策摘要 (便于复盘) ----
     if need_factors and cut_codes:
