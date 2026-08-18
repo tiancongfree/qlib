@@ -301,7 +301,7 @@ def sync_positions(
     price_slippage: float = 0.002,
     auction_filter: bool = False,
     auction_observe: bool = True,
-    auction_top_cut: int = 5,
+    auction_cut_threshold: float = -50.0,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
     auction_wait_until: str = "09:24:30",
@@ -313,13 +313,18 @@ def sync_positions(
 
     Filter logic (only when auction_filter=True):
       - candidate pool = all qlib target stocks
-      - rank the pool by auction_buy_strength (ascending), take the bottom
-        ``auction_top_cut`` stocks
-      - retail exemption: a bottom-cut stock whose retail_sell_strength is above
-        ``retail_exempt_threshold`` is EXEMPT (held position kept, new buy kept),
-        because the original article treats heavy retail selling as a contrarian
-        bullish signal
-      - remaining bottom-cut stocks:
+      - cut every stock whose auction_buy_strength is BELOW ``auction_cut_threshold``
+        (absolute-threshold rule, no fixed cut count)
+      - rationale: the factor ≈ gap (open-1) scaled by a bid-balance tone, so its
+        sign carries the market regime — on a broadly-up day most strengths are
+        positive (few/no cuts), on a broadly-down day many low-open names fall
+        below the threshold and get trimmed. A fixed bottom-N would instead waste
+        trades on "least strong" names even in a strong market.
+      - retail exemption: a below-threshold stock whose retail_sell_strength is
+        above ``retail_exempt_threshold`` is EXEMPT (held position kept, new buy
+        kept), because the original article treats heavy retail selling as a
+        contrarian bullish signal
+      - remaining cut stocks:
           * if currently held  -> SELL the whole position
           * if not held        -> skip (no BUY order)
       - all other target stocks -> normal buy/add/trim
@@ -349,8 +354,11 @@ def sync_positions(
     auction_observe : bool
         Compute/print/log the would-be filter decision WITHOUT applying it.
         Default True.
-    auction_top_cut : int
-        Number of weakest-factor target stocks to cut from the bottom. Default 5.
+    auction_cut_threshold : float
+        Absolute-strength threshold: every target stock with auction_buy_strength
+        BELOW this value is cut (no fixed count). Default -50.0. On a broadly-up
+        day few names fall below it (little/nothing cut); on a broadly-down day
+        many low-open names do (trimmed accordingly).
     retail_exempt_threshold : float, optional
         If set, a bottom-cut stock with retail_sell_strength above this value is
         exempt from being cut (contrarian bullish). Default None = no exemption.
@@ -433,31 +441,26 @@ def sync_positions(
     target_set_all = set(target_stocks.keys())
     actual_set = set(actual.keys())
 
-    # ---- 集合竞价短线过滤器: 从 target 全集中裁剪弱因子股 ----
-    # candidate pool = all target stocks; sort by auction_buy_strength ASC,
-    # cut the bottom `auction_top_cut` stocks, with retail contrarian exemption.
-    # Guard: when the pool is smaller than the cut count, trim the bottom
-    # (len-1) instead of the whole pool, so a small portfolio never ends up
-    # with zero buys (the strongest candidate is always preserved).
-    # In observation mode the same decision is computed and logged but NOT
-    # applied to the target list.
+    # ---- 集合竞价短线过滤器: 从 target 全集中裁剪绝对弱势股 ----
+    # candidate pool = all target stocks; sort by auction_buy_strength ASC.
+    # 方案A (绝对阈值, 无上限): 裁掉所有 auction_buy_strength < threshold 的股票。
+    # 因子 ≈ gap 缩放(低开->负, 高开->正), 符号携带市场强弱 → 普涨日多数为正
+    # 少裁/不裁, 普跌日低开股多则多裁; 不再用固定 bottom-N (普涨日末5也常是正因子,
+    # 裁掉=浪费; 普跌日末5反而漏掉同池更弱的一批)。
+    # 保留: 散户豁免(散户反向看多) + 观察模式(算+打印+记日志, 不实际裁剪)。
     cut_codes = []
-    if need_factors and auction_top_cut > 0 and target_set_all:
+    if need_factors and target_set_all:
         ranked = sorted(target_set_all, key=lambda c: _strength(c))
-        if len(ranked) > 1 and len(ranked) <= int(auction_top_cut):
-            print(f"  ⚠️ 候选池 {len(ranked)} 只 ≤ 裁剪数 {int(auction_top_cut)}, "
-                  f"为避免组合被裁光, 只裁末 {len(ranked)-1} 只 (保留因子最强 1 只)")
-        n_cut = min(int(auction_top_cut), max(0, len(ranked) - 1)) if len(ranked) > 1 else 0
-        bottom = ranked[:n_cut]
+        below = [c for c in ranked if _strength(c) < auction_cut_threshold]
         mode = "实际裁剪" if auction_filter else "观察模式(不实际裁剪)"
         print(f"\n  集合竞价短线过滤器 [{mode}]: 候选 {len(target_set_all)} 只, "
-              f"按 auction_buy_strength 升序, 取末 {len(bottom)} 只")
+              f"绝对阈值 {auction_cut_threshold:.2f}, 低于阈值 {len(below)} 只")
         print(f"  {'code':<10}{'strength':>10}{'retail':>10}  {'hold?':>6}")
         for c in ranked:
-            star = "*" if c in set(bottom) else " "
+            star = "*" if c in set(below) else " "
             print(f"  {star}{c:<9}{_strength(c):>10.2f}{_retail(c):>10.2f}  "
                   f"{'HOLD' if c in actual_set else 'none':>6}")
-        for c in bottom:
+        for c in below:
             exempt = False
             if retail_exempt_threshold is not None and _retail(c) > retail_exempt_threshold:
                 exempt = True
@@ -625,7 +628,7 @@ def main(
     allow_empty_holdings: bool = False,
     auction_filter: bool = False,
     auction_observe: bool = True,
-    auction_top_cut: int = 5,
+    auction_cut_threshold: float = -50.0,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
     auction_wait_until: str = "09:24:30",
@@ -758,7 +761,7 @@ def main(
             price_slippage=price_slippage,
             auction_filter=auction_filter,
             auction_observe=auction_observe,
-            auction_top_cut=auction_top_cut,
+            auction_cut_threshold=auction_cut_threshold,
             retail_exempt_threshold=retail_exempt_threshold,
             obs_log=obs_log,
             auction_wait_until=auction_wait_until,
