@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import baostock as bs
+import baostock as bs  # noqa: F401 (imported for its public API below)
 sys.path.insert(0, str(Path.home() / "qlib"))
 from scripts.dump_bin import DumpDataUpdate
 QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
@@ -141,67 +141,174 @@ def _query_stock_timeout(bs_sym: str, start: str, end: str, per_stock_timeout: f
 
 
 def download(stock_list, start, end):
-    """Download baostock data for all stocks."""
+    """Download baostock data for all stocks.
+
+    Falls back to the akshare Sina source (stock_zh_a_daily, adjust=qfq) if the
+    baostock login fails. The Sina qfq series is numerically identical to
+    baostock's adjustflag=2 (verified across several stocks), so the returned
+    data is in the same forward-adjusted coordinate system and map_and_scale
+    needs no changes.
+    """
     lg = bs.login()
     if lg.error_code != "0":
-        raise RuntimeError(f"baostock login failed: {lg.error_msg}")
-    # Pre-filter: skip 北交所 stocks (bj.*) which are never selected
+        print(f"  baostock login failed: {lg.error_msg}; falling back to akshare Sina...")
+        return download_akshare_sina(stock_list, start, end)
+    try:
+        # Pre-filter: skip 北交所 stocks (bj.*) which are never selected
+        a_share_list = [s for s in stock_list if not s.startswith("bj")]
+        bj_skipped = len(stock_list) - len(a_share_list)
+        print(f"  Filtered out {bj_skipped} 北交所 stocks, {len(a_share_list)} remaining")
+        stock_list = a_share_list
+
+        all_data = []
+        total = len(stock_list)
+        fail = 0
+        timeout = 0
+        chunk = 200
+        for i in range(0, total, chunk):
+            batch = stock_list[i : i + chunk]
+            batch_id = i // chunk + 1
+            for fname in batch:
+                bs_sym = fname_to_bs(fname)
+                print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
+                try:
+                    # adjustflag=2: forward-adjusted (all prices at current level)
+                    rs = _query_stock_timeout(bs_sym, start, end, per_stock_timeout=30)
+                    if rs is None:
+                        timeout += 1
+                        fail += 1
+                        print(" TIMEOUT(skip)", flush=True)
+                        # A hung socket poisons the baostock session; re-login to recover.
+                        try:
+                            bs.logout()
+                        except Exception:
+                            pass
+                        lg = bs.login()
+                        if lg.error_code != "0":
+                            raise RuntimeError(f"baostock re-login failed: {lg.error_msg}")
+                        continue
+                    if rs.error_code != "0":
+                        fail += 1
+                        print(" FAIL", flush=True)
+                        continue
+                    rows = []
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+                    if not rows:
+                        print(" empty", flush=True)
+                        continue
+                    df = pd.DataFrame(rows, columns=rs.fields)
+                    df["symbol"] = fname.lower()
+                    all_data.append(df)
+                    print(" OK", flush=True)
+                except Exception:
+                    fail += 1
+                    print(" ERROR", flush=True)
+            progress = min(i + chunk, total)
+            print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out)", flush=True)
+            time.sleep(0.3)
+        bs.logout()
+        if not all_data:
+            raise RuntimeError(f"No data downloaded ({fail} failures)")
+        print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out)")
+        # If too many single-stock failures, fall back to akshare for the losers.
+        if fail > 0:
+            print(f"  {fail} stocks failed on baostock; backfilling them via akshare Sina...")
+            ok_set = {d["symbol"].iloc[0] for d in all_data}
+            missing = [s for s in stock_list if s not in ok_set]
+            if missing:
+                fill = download_akshare_sina(missing, start, end)
+                all_data.extend(fill)
+                print(f"  akshare backfill added {len(fill)} stocks")
+        bs.logout()
+        return all_data
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def _akshare_sina(sym: str, start: str, end: str, max_retry: int = 5) -> pd.DataFrame:
+    """Fetch one stock's daily bars from the akshare Sina source (qfq).
+
+    Returns a DataFrame with baostock-compatible columns (same forward-adjusted
+    coordinate system). Empty DataFrame on repeated network failure.
+    """
+    import akshare as ak
+
+    retries = 0
+    while retries < max_retry:
+        try:
+            df = ak.stock_zh_a_daily(
+                symbol=sym, start_date=start, end_date=end, adjust="qfq"
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            print(f"      akshare {sym} retry {retries}: {str(e)[:80]}")
+        retries += 1
+        time.sleep(1.5 * retries)
+    return pd.DataFrame()
+
+
+def download_akshare_sina(stock_list, start, end):
+    """Download data for ``stock_list`` via akshare Sina source (qfq fallback).
+
+    Returns the same structure as :func:`download`: a list of per-stock
+    DataFrames each with baostock-style columns
+    (date, open, high, low, close, volume, amount, preclose, pctChg) + symbol.
+    The Sina qfq prices match baostock adjustflag=2 exactly, so these frames plug
+    straight into map_and_scale.
+
+    Only the A-share (non-北交所) subset is requested; symbol codes are converted
+    SH600519 -> sh600519 for the Sina API.
+    """
+    import akshare as ak  # noqa: F401  (imported for its public API below)
+
     a_share_list = [s for s in stock_list if not s.startswith("bj")]
     bj_skipped = len(stock_list) - len(a_share_list)
-    print(f"  Filtered out {bj_skipped} 北交所 stocks, {len(a_share_list)} remaining")
-    stock_list = a_share_list
-
+    if bj_skipped:
+        print(f"  [akshare] skipped {bj_skipped} 北交所 stocks")
+    total = len(a_share_list)
+    print(f"  [akshare] fetching {total} stocks from Sina (qfq -> {start}..{end})")
     all_data = []
-    total = len(stock_list)
     fail = 0
-    timeout = 0
-    chunk = 200
-    for i in range(0, total, chunk):
-        batch = stock_list[i : i + chunk]
-        batch_id = i // chunk + 1
-        for fname in batch:
-            bs_sym = fname_to_bs(fname)
-            print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
-            try:
-                # adjustflag=2: forward-adjusted (all prices at current level)
-                rs = _query_stock_timeout(bs_sym, start, end, per_stock_timeout=30)
-                if rs is None:
-                    timeout += 1
-                    fail += 1
-                    print(" TIMEOUT(skip)", flush=True)
-                    # A hung socket poisons the baostock session; re-login to recover.
-                    try:
-                        bs.logout()
-                    except Exception:
-                        pass
-                    lg = bs.login()
-                    if lg.error_code != "0":
-                        raise RuntimeError(f"baostock re-login failed: {lg.error_msg}")
-                    continue
-                if rs.error_code != "0":
-                    fail += 1
-                    print(" FAIL", flush=True)
-                    continue
-                rows = []
-                while rs.next():
-                    rows.append(rs.get_row_data())
-                if not rows:
-                    print(" empty", flush=True)
-                    continue
-                df = pd.DataFrame(rows, columns=rs.fields)
-                df["symbol"] = fname.lower()
-                all_data.append(df)
-                print(" OK", flush=True)
-            except Exception:
-                fail += 1
-                print(" ERROR", flush=True)
-        progress = min(i + chunk, total)
-        print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out)", flush=True)
-        time.sleep(0.3)
-    bs.logout()
-    if not all_data:
-        raise RuntimeError(f"No data downloaded ({fail} failures)")
-    print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out)")
+    for i, fname in enumerate(a_share_list):
+        sym = fname.lower()  # sh600519 works for stock_zh_a_daily
+        print(f"    [{i + 1}/{total}] {fname} ...", end="", flush=True)
+        df = _akshare_sina(sym, start.replace("-", ""), end.replace("-", ""))
+        if df.empty:
+            fail += 1
+            print(" FAILED", flush=True)
+            time.sleep(0.5)
+            continue
+        # drop any time component -> date string, and coerce to numeric
+        df = df.copy()
+        df["date"] = df["date"].astype(str).str[:10]
+        df["open"] = pd.to_numeric(df["open"], errors="coerce")
+        df["high"] = pd.to_numeric(df["high"], errors="coerce")
+        df["low"] = pd.to_numeric(df["low"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        ok = df.dropna(subset=["close"])
+        if ok.empty:
+            fail += 1
+            print(" NO VALID", flush=True)
+            time.sleep(0.5)
+            continue
+        # state: qfq series uses sina's forward-adjusted coord == baostock flag=2
+        ok = ok.copy()
+        # preclose = previous day's close; pctChg = today's change %
+        ok["preclose"] = ok["close"].shift(1)
+        ok["pctChg"] = (ok["close"] / ok["preclose"] - 1.0) * 100.0
+        ok["symbol"] = fname.lower()
+        all_data.append(ok)
+        print(f" OK ({len(ok)} rows)", flush=True)
+        time.sleep(0.4)  # be gentle with the Sina API
+    if fail:
+        print(f"  [akshare] {fail} stocks failed")
     return all_data
 
 def read_all_instruments():
