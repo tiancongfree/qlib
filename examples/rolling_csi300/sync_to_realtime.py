@@ -276,15 +276,13 @@ def _append_obs_log(
         print(f"  WARNING: 观察日志写入失败: {e}")
 
 
-def _wait_for_auction_snapshot(wait_until: str = "09:24:30", enabled: bool = True):
-    """Sleep until the 集合竞价不可撤单段末 before grabbing the Tencent snapshot.
+def _wait_for_auction_snapshot(wait_until: str = "09:30:00", enabled: bool = True):
+    """Sleep until just-after-open before grabbing the Tencent snapshot.
 
-    The scheduled daily task starts at 09:19; the preceding rolling backtest +
-    model loading take a couple of minutes, so by the time we reach the snapshot
-    fetch it is usually ~09:21-09:23. The auction factors (gap, bid-balance) are
-    only meaningful when the snapshot is taken inside the 9:20-9:25 non-cancellable
-    window — the opening auction closes at 9:25 and the open price is fixed then.
-    So we wait until ``wait_until`` (default 09:24:30) unless it is already past
+    After 09:30 the market has real trades, so the snapshot can report real
+    内外盘/均价 (accumulated from actual fills) instead of empty/zero auction
+    values. The gap (今开 vs 昨收) is fixed at 09:25 and stays valid.
+    So we wait until ``wait_until`` (default 09:30:00) unless it is already past
     (manual run / after-market / non-trading day → snapshot fetched immediately).
 
     Only sleeps when the current time is between 09:00 and ``wait_until``; never
@@ -320,7 +318,7 @@ def sync_positions(
     auction_cut_threshold: float = -50.0,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
-    auction_wait_until: str = "09:24:30",
+    auction_wait_until: str = "09:30:00",
     auction_wait: bool = True,
 ):
     """
@@ -383,8 +381,10 @@ def sync_positions(
         stock per run). Used for post-hoc win-rate statistics.
     auction_wait_until : str
         Wall-clock time (HH:MM:SS) to wait for before fetching the Tencent
-        snapshot. Default "09:24:30" = end of the 9:20-9:25 non-cancellable
-        auction window. See :func:`_wait_for_auction_snapshot`.
+        snapshot. Default "09:30:00" = just after the opening auction / at the
+        start of continuous trading, when real 内外盘/均价 are available (at
+        09:24 they are still empty until actual fills happen). See
+        :func:`_wait_for_auction_snapshot`.
     auction_wait : bool
         Enable the wait. Default True (scheduled runs start 09:19; the snapshot
         must be taken inside the auction window for the factors to be valid).
@@ -662,7 +662,7 @@ def main(
     auction_cut_threshold: float = -50.0,
     retail_exempt_threshold: float = None,
     obs_log: str = None,
-    auction_wait_until: str = "09:24:30",
+    auction_wait_until: str = "09:30:00",
     auction_wait: bool = True,
 ):
     print("=" * 60)
