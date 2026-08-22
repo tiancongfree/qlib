@@ -40,6 +40,16 @@
 - 数据/缓存/mlruns 单独 scp (5.4GB 缓存, md5 校验 a5e51d81)
 - 244 桌面 run_daily.ps1 需手动 scp 同步 (它不在 git 里, 是实际调度用的)
 
+### sync 双模式 + 方案D (2026-08-22, sync_to_realtime.py)
+- **双模式判定** (`detect_mode`): setup (建仓) = 空仓 或 target∩actual 交集占比 <50%; 否则 daily (日常)
+  - setup: 一次性全量同步到 qlib target (首次建仓/重训后大换血自动触发, 如 2026-08-22 交集仅 9.7%)
+  - daily: 严格按 target 增删 (换入换出)
+  - `--allow-empty-holdings` 参数已移除, 空仓在 daily 模式仍拦截, setup 模式放行
+- **方案 D** (持仓期间股数锁定): 移除 stocks_in_both 的每日 BUY+/SELL- 微调
+  - 依据: qlib TopkDropout 持仓段内 amount 恒定 (验证: 397股1560次变化全在 count_day=1 重新买入, 零例外)
+  - 微调单 = 纯整手对齐噪音 (观察期 17笔 vs 换股 6笔), 年化成本 ~0.25%, 非 alpha 来源
+- **15% 极端权重保险**: 实盘单票市值占比 >15% 时卖出超额部分 (整手: 主板100/科创200), 基于实盘实际权重非 qlib 目标权重 (qlib topk=30 天然 <12%)
+
 ## 核心研究结论
 
 ### 1. 分红融资比因子 (dvratio) → 已否决
