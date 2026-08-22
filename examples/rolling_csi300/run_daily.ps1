@@ -160,6 +160,7 @@ $wslCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath run_workflow.
 $icDecayCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath analyze_ic_decay.py --exp_name rolling_csi300_lgbm --freq quarterly --output_dir /home/tc/qlib/examples/rolling_csi300; echo __EXIT__`$?"
 $equityCurveCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath analyze_equity_curve.py --exp_name rolling_csi300_lgbm; echo __EXIT__`$?"
 $ddAlertCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath dd_alert.py --exp_name rolling_csi300_lgbm; echo __EXIT__`$?"
+$monitorIcCmd = "cd /home/tc/qlib/examples/rolling_csi300 && $pythonPath monitor_ic.py --exp_name rolling_csi300_lgbm_ndrop1; echo __EXIT__`$?"
 
 Write-Log "Running: $($wslCmd -replace [regex]::Escape($ApiKey), '****')"
 
@@ -206,6 +207,17 @@ if ($exitCode -eq 0) {
         $line = $_ -replace "`r", ""
         if ($line -match '__EXIT__(\d+)') {
             Write-Log "Drawdown alert exit code: $([int]$Matches[1])"
+        } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
+            [Console]::WriteLine($line)
+            Add-Content -Path $logFile -Value $line -Encoding UTF8
+        }
+    }
+    # Run IC health monitor; warns on sustained low RankIC.
+    Write-Log "Running IC monitor..."
+    wsl -u tc bash -c $monitorIcCmd 2>&1 | ForEach-Object {
+        $line = $_ -replace "`r", ""
+        if ($line -match '__EXIT__(\d+)') {
+            Write-Log "IC monitor exit code: $([int]$Matches[1])"
         } elseif ($line -ne "" -and -not (Test-LogNoise $line)) {
             [Console]::WriteLine($line)
             Add-Content -Path $logFile -Value $line -Encoding UTF8
