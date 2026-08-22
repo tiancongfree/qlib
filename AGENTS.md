@@ -5,10 +5,40 @@
 ## 策略概况
 
 - **策略**: rolling 滚动重训 + LightGBM(Alpha158Industry) + ICTimingStrategy, CSI300 内选股
-- **市场**: CSI300, 回测区间 2020-01~2026-07
+- **市场**: CSI300, 回测区间 2020-01~2026-08 (数据已到 08-21)
 - **基准配置**: `rolling_config.yaml` (已固化 **n_drop=1**, topk=30, ICTiming 动态降仓)
 - **当前 baseline**: `rolling_csi300_lgbm_ndrop1` (mlruns 实验)
 - **关键指标** (n_drop=1 + ICTiming, 2020-2026, 净成本): 年化超额 ~17.9%, IR 1.44, 最大回撤 -18.4%, 换手 16/yr
+
+## ⚠️ 每日 pred 冻结 bug (2026-08-22 已修复, 重要!)
+
+### 症状
+- 244 每日 `--skip-train` 回测/实盘 **持仓长期冻结**: 2026-08 三周内只换仓 1 次, 五粮液/长安/赛力斯等低分股一直挂着
+- 即使数据更新到 08-21, 目标名单仍停留在 07-31 的决策
+
+### 根因 (架构缺陷, 非 qlib bug)
+- qlib rolling 的 pred **只在训练时生成** (每期模型对固定 test 窗口 predict 一次), 两次重训 (3个月) 之间新日期**没有新 pred**
+- `run_rolling.py --skip-train` 只是**重复拼接已有 pred + 回测**, 不产生新预测 → 回测永远用旧 pred → 持仓冻结
+- 244 的 `run_daily.ps1` 用 `run_workflow.py --skip-train`, 每日"看似在跑"实际只是重放 07-31 预测
+
+### 修复方案 (daily_predict.py + 每月重训)
+- **`daily_predict.py`**: 用最新一期已训模型对「上一 pred 末+1 → 今天」推理新 pred, append 进 ensemble pred (dedup 取最新)
+  - 特征用 QlibDataLoader + IndustryProcessor **即时计算** (已验证与 5.4GB 缓存数值完全一致, diff=0), 不依赖缓存更新
+  - 已验证: standalone 预测与训练时 ensemble pred 完全一致
+- **`run_workflow.py`**: 数据更新后插入 daily_predict (step 2), 再回测
+- **每月 1/15 号重训** (本机 cron): `monthly_retrain.sh` 完整重训 → 推新 rolling 实验 + 缓存 + pred 到 244
+- **`monitor_ic.py`**: 每日 IC 健康监控 (前瞻20天+因果shift20, 与 ICTiming 同口径), 连续 <0.03 报警
+- **验证**: 修复后 8 月换仓 9 次 (修复前 2 次), 三只目标股全部换出; 本机与 244 pred/指标一致
+
+### 关键教训
+- **任何"每日流程"必须确认 pred 真的覆盖到最新日期**, 不能只看日志"跑成功"
+- `--skip-train` = 复用旧结果, 不是"用新数据预测"
+- 重训换模型会改变评分 → 持仓可能大幅变化 (n_drop=1 天然限速 1 只/天, 无需担心)
+
+### 部署要点
+- 代码走 git (本机 commit → congt, GitHub 被墙用 git bundle)
+- 数据/缓存/mlruns 单独 scp (5.4GB 缓存, md5 校验 a5e51d81)
+- 244 桌面 run_daily.ps1 需手动 scp 同步 (它不在 git 里, 是实际调度用的)
 
 ## 核心研究结论
 
@@ -355,7 +385,11 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
   - **观察模式 (auction_observe, 默认 True)**: 算因子 + 完整打印"若开启会裁剪谁"的决策 + 把每日决策 append 到 `auction_observe_log.csv`, 但**不修改目标名单** (正常按 qlib 下单)。唯一目的 = 积累胜率统计样本。CSV 列: date/code/auction_buy_strength/retail_sell_strength/would_cut/held; 日后用下日收益对比 would_cut=True vs False 两组算胜率
   - **接口防护 (重要)**: 全流程腾讯行情只调**一次**批量快照 (目标+实际持仓合集, ≤50只/请求), 严禁逐股调用 → 防封号。原 `_load_real_prices` 二次调用已合并
   - **debug 打印 (2026-08-17 加, 因操作者隔日不在场)**: 完整输出因子横截面排序表 (*标末N)、每只裁剪原因 (全卖/跳过/豁免)、卖出原因标注 (因子裁剪 vs qlib调出)、过滤器决策摘要 (候选数/裁剪数/全卖/跳过/豁免/保留数 + [实际执行/仅观察] 标注)
-  - **集合竞价抓取定时 (2026-08-17 加)**: 定时任务 09:19 启动, 回测+加载模型到抓快照通常 09:21-23。因子 (gap/挂单失衡) 只在 9:20-9:25 不可撤单段才有意义 → 抓快照前 `_wait_for_auction_snapshot` sleep 到 `--auction-wait-until` (默认 `09:24:30`) 再批量抓。仅在 [09:00, wait_until) 时段等待, 过点/盘后/手动补跑不等待 (不会跨午夜)。`--auction-wait False` 可关
+  - **集合竞价抓取定时 (2026-08-17 加, 08-18 改为 09:30)**: 定时任务 09:19 启动。2026-08-18 起 `--auction-wait-until` 默认改 **09:30:00**(开盘后抓):竞价段(9:15-9:25)内外盘/均价因无真实成交恒为0/无效,开盘后才有真实累积值;gap(今开)9:25 定格全天不变仍有效。仅在 [09:00, wait_until) 时段等待, 过点/盘后/手动补跑不等待 (不会跨午夜)。`--auction-wait False` 可关
+- **科创板委托手数规则 (2026-08-18 加, 重要)**: 科创板 (688/689) 与主板不同 — **买入单笔须 ≥200股** (超出可按1股递增), 卖出若持仓余额 <200 须一次性全卖 (零头只能整体清仓)。`sync_to_realtime.py` 已按 `_lot_size(code)` 区分 (688/689=200, 其余=100):
+  - `_to_lots` 按对应 hand 数向下取整, 科创板 <200 股直接归 0 (不买, 避免违规 x100 买单)
+  - BUY+/SELL- 调仓差 <200 时: BUY+ 跳过加仓; SELL- 改为全卖剩余 (而非卖零头)
+  - 背景: 08-18 全天出现 `BUY+ 688472 x 100 -> FAIL` (科创板买100股被交易所/券商拒); 修复后此类下单合规
 
 ### 分批建仓方案 (关键变更: 2026-08-13 已清仓转模拟盘, 此方案归档)
 
