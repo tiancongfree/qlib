@@ -94,8 +94,19 @@ def main(
     else:
         step_header(1, "Update qlib data from baostock (SKIPPED by --skip-update)")
 
-    # ---- Step 2: Rolling backtest ----
-    step_header(2, "Rolling backtest")
+    # ---- Step 2: Daily inference for new dates ----
+    # Generate preds for the days after the last rolling pred with the newest
+    # trained model, so the backtest below has a real decision each day instead
+    # of replaying stale preds.  Standalone feature computation is used whenever
+    # the handler cache does not cover the latest data (i.e. between retrains).
+    step_header(2, "Daily inference (new-day preds)")
+    predict_cmd = [sys.executable, "daily_predict.py", "--exp-name", exp_name]
+    ok = run(predict_cmd, "daily_predict", timeout=900)
+    if not ok:
+        print("WARNING: Daily inference failed. Backtest will use existing preds.")
+
+    # ---- Step 3: Rolling backtest ----
+    step_header(3, "Rolling backtest")
     cmd = [sys.executable, "run_rolling.py"]
     if skip_train:
         cmd.append("--skip_train")
@@ -104,9 +115,9 @@ def main(
         print("ERROR: Rolling backtest failed.")
         sys.exit(1)
 
-    # ---- Step 3: Sync to real trading ----
+    # ---- Step 4: Sync to real trading ----
     if sync:
-        step_header(3, "Sync to real trading")
+        step_header(4, "Sync to real trading")
         cmd = [
             sys.executable, "sync_to_realtime.py",
             "--host", host,
