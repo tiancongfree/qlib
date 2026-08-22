@@ -59,6 +59,28 @@ def load_target_positions(exp_name: str, last_positions_csv: str = None) -> pd.D
     return save_last_day_positions(exp_name=exp_name)
 
 
+def detect_mode(target_set: set, actual_set: set) -> str:
+    """Classify the sync as ``setup`` (建仓) or ``daily`` (日常).
+
+    Rules:
+      - empty account (``actual_set`` is empty)  -> setup (first-time build / full reset)
+      - overlap ratio ``|target ∩ actual| / |target|`` < 0.5 -> setup (portfolio largely
+        diverged, e.g. after a model retrain reshuffles the target list)
+      - otherwise -> daily (normal incremental rebalance)
+
+    In setup mode the account may genuinely start from zero, so the empty-account
+    safety guard is bypassed and the full target is bought.  In daily mode an empty
+    account is still treated as a (likely transient) query failure and aborts.
+    """
+    if not actual_set:
+        return "setup"
+    if not target_set:
+        return "daily"
+    overlap = len(target_set & actual_set)
+    ratio = overlap / len(target_set)
+    return "setup" if ratio < 0.5 else "daily"
+
+
 def get_actual_holdings(client: TradeClient) -> dict | None:
     """Query current holdings from easyths, return {stock_code: shares}.
 
@@ -320,6 +342,8 @@ def sync_positions(
     obs_log: str = None,
     auction_wait_until: str = "09:30:00",
     auction_wait: bool = True,
+    mode: str = "daily",
+    max_weight: float = 0.15,
 ):
     """
     Compare target vs actual and place buy/sell orders, with an optional
@@ -457,6 +481,11 @@ def sync_positions(
     target_set_all = set(target_stocks.keys())
     actual_set = set(actual.keys())
 
+    # 双模式: setup (建仓) / daily (日常)。
+    # 建仓模式 = 空仓 或 交集占比 <50%: 一次性全量同步到 qlib target。
+    # 日常模式 = 正常持仓: 严格按 target 增删 (换入换出), 不微调数量。
+    print(f"  Sync mode: {mode} (target {len(target_set_all)}, actual {len(actual_set)})")
+
     # ---- 集合竞价短线过滤器: 从 target 全集中裁剪绝对弱势股 ----
     # candidate pool = all target stocks; sort by auction_buy_strength ASC.
     # 方案A (绝对阈值, 无上限): 裁掉所有 auction_buy_strength < threshold 的股票。
@@ -588,36 +617,49 @@ def sync_positions(
         limit_price = round(rp * (1 + price_slippage), 2) if rp else None
         do("BUY", ths, target_stocks[code], limit_price)
 
-    # ---- Adjust quantities for stocks in both ----
-    # BUY+ (add) heavy-weight first; SELL- (trim) light-weight first, so that
-    # when T+1 cash is short the heavy positions get topped up preferentially.
+    # ---- Held stocks in both target & actual: lock quantities (方案 D) ----
+    # qlib's TopkDropoutStrategy never rebalances a held stock's share count
+    # during a holding period (verified: amount is constant until a re-buy,
+    # count_day resets to 1).  Weight drift is purely price-driven (尾部爬升).
+    # So the live account must also lock held share counts; daily BUY+/SELL- 微调
+    # would be pure integer-lot jitter against a qlib target that itself never
+    # adjusts, adding cost (min_cost 5元) with zero alpha.
+    #
+    # One exception: an extreme-weight safety net.  If a HELD stock's REAL
+    # market-value weight (current_value / max_total) exceeds ``max_weight``
+    # (default 15%), trim the excess so a single name cannot dominate.  The
+    # qlib target weight is not used here: qlib's topk=30 dispersion keeps it
+    # below ~12% historically, while a live price spike can push a real holding
+    # far above that.  Trim uses the stock's own lot size (100 main/ChiNext,
+    # 200 STAR market).
+    excess_trim = []
     for code in sorted(stocks_in_both, key=lambda c: (-_weight(c), c)):
-        target_qty = target_stocks[code]
-        actual_qty = int(actual[code])
-        diff = target_qty - actual_qty
         ths = _qlib_to_ths(code)
         rp = ref_prices.get(code) or ref_prices.get(ths)
-        if diff > 0:
-            lot = _lot_size(code)
-            if lot > 100 and diff < lot:
-                # 科创板 BUY+: 目标-实际须 ≥200 股才能加仓; 不足则差是历史零头,
-                # 无法补到一个合法 200 倍数, 跳过该加仓 (避免 x100 违规买单)。
-                print(f"  # {code}: BUY+ 差 {diff} 股 < 科创板最小 200 股, 跳过加仓",
-                      flush=True)
-                continue
-            limit_price = round(rp * (1 + price_slippage), 2) if rp else None
-            do("BUY+", ths, diff, limit_price)
-        elif diff < 0:
-            sell_qty = abs(diff)
-            # 科创板 (688/689): 余额不足 200 股时必须一次性全卖, 不能卖出
-            # 一个小于 200 的零头 (卖出申报须 ≥200 股, 零头只能整体清仓)。
-            lot = _lot_size(code)
-            if lot > 100 and sell_qty < lot:
-                print(f"  # {code}: SELL- {sell_qty} 股 < 科创板最小 200 股, "
-                      f"改为全卖剩余 {actual_qty} 股", flush=True)
-                sell_qty = actual_qty
+        if not rp or rp <= 0:
+            continue
+        current_value = int(actual[code]) * rp
+        if not max_total or max_total <= 0:
+            continue
+        current_weight = current_value / max_total
+        if current_weight <= max_weight or max_weight <= 0:
+            continue
+        target_value = max_total * max_weight
+        excess_value = current_value - target_value
+        excess_shares = int(excess_value / rp)
+        lot = _lot_size(code)
+        excess_shares = (excess_shares // lot) * lot  # 整手向下取整
+        if excess_shares >= lot:
             limit_price = round(rp * (1 - price_slippage), 2) if rp else None
-            do("SELL-", ths, sell_qty, limit_price)
+            print(f"  # {code}: 实盘权重 {current_weight:.1%} > {max_weight:.0%}, 减仓 {excess_shares} 股 "
+                  f"(市值 {current_value:.0f} → 目标 {target_value:.0f})", flush=True)
+            do("SELL-W", ths, excess_shares, limit_price)
+            excess_trim.append(code)
+    if not excess_trim:
+        print(f"  [方案D] {len(stocks_in_both)} 只持仓期间股数锁定, 不微调 "
+              f"(qlib 持仓段内 amount 恒定, 实盘对齐该行为)")
+    else:
+        print(f"  [方案D] {len(stocks_in_both)} 只持仓锁定, 其中 {len(excess_trim)} 只触发极端权重减仓")
 
     # ---- 过滤器决策摘要 (便于复盘) ----
     if need_factors and cut_codes:
@@ -656,7 +698,6 @@ def main(
     dry_run: bool = True,
     invest_ratio: float = 0.95,
     price_slippage: float = 0.002,
-    allow_empty_holdings: bool = False,
     auction_filter: bool = False,
     auction_observe: bool = True,
     auction_cut_threshold: float = -50.0,
@@ -765,18 +806,23 @@ def main(
             print("ERROR: Holdings query failed. Aborting sync to avoid placing orders "
                   "on an unknown account state (would re-buy every target stock).")
             sys.exit(1)
-        if not actual and not allow_empty_holdings:
+        # 双模式判定: setup (建仓) = 空仓 或 与 target 交集占比 <50%。
+        # 建仓模式放行空仓 (首次建仓/大换血), 日常模式空仓仍视为查询失败拦截。
+        target_code_set = {idx[0] for idx in target.index if target.loc[idx].get("amount", 0) > 0}
+        mode = detect_mode(target_code_set, set(actual.keys()))
+        if not actual and mode == "daily":
             print("=" * 60)
-            print("  SAFETY GUARD: holdings query returned EMPTY account.")
+            print("  SAFETY GUARD: holdings query returned EMPTY account (daily mode).")
             print("  This is usually a transient easyths/broker failure (the broker")
             print("  returned empty text and easyths parsed it into an empty DataFrame")
             print("  while still reporting success=True), NOT a genuinely empty account.")
             print("  Proceeding would re-buy every target stock (duplicate orders).")
-            print("  ABORTING. If the account is truly empty (first-time setup), re-run")
-            print("  with --allow-empty-holdings True to force it through.")
+            print("  ABORTING. A truly empty account (first-time setup / full reset)")
+            print("  is auto-detected as SETUP mode and handled automatically.")
             print("=" * 60)
             sys.exit(1)
         print(f"  Current holdings: {len(actual)} stocks")
+        print(f"  Sync mode: {mode}")
 
         if not dry_run:
             cancel_result = client.cancel_order()
@@ -797,6 +843,7 @@ def main(
             obs_log=obs_log,
             auction_wait_until=auction_wait_until,
             auction_wait=auction_wait,
+            mode=mode,
         )
 
 
