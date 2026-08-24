@@ -107,7 +107,7 @@ def main(
 
     # ---- Step 3: Rolling backtest ----
     step_header(3, "Rolling backtest")
-    cmd = [sys.executable, "run_rolling.py"]
+    cmd = [sys.executable, "run_rolling.py", "--exp-name", exp_name]
     if skip_train:
         cmd.append("--skip_train")
     ok = run(cmd, "run_rolling")
