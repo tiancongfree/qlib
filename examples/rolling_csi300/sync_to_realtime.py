@@ -103,13 +103,12 @@ def get_actual_holdings(client: TradeClient) -> dict | None:
         if "holdings" in data or "data" in data:
             holdings_list = data.get("holdings", data.get("data", []))
         elif not data:
-            # Empty dict with no holdings/data key: easyths reported success=True
-            # but failed to parse the broker response into a DataFrame (e.g.
-            # "No columns to parse from file" -> holding={}).  This is NOT a
-            # trustworthy empty account -> treat as query failure.
-            print("ERROR: Holdings payload empty/unparseable (easyths parsed an empty "
-                  "broker response as success=True). Refusing to treat as empty account.")
-            return None
+            # Empty dict with no holdings/data key = genuinely empty account
+            # (easyths performed a real UI query and found zero positions, e.g.
+            # the log shows `持仓查询完成 ... holding={}`).  Return empty dict so
+            # detect_mode classifies this as setup (first-time build), NOT as a
+            # query failure.  `None` is reserved for a failing query (success=False).
+            holdings_list = []
         else:
             holdings_list = data
     else:
