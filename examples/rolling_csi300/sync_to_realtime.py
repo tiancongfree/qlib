@@ -160,13 +160,19 @@ def _lot_size(code: str) -> int:
 
 
 def _to_lots(shares: float, code: str = "") -> int:
-    """Round shares down to the nearest lot size (100 or 200 for 科创板).
+    """Round shares to a valid lot size (100, or 200 for 科创板 688/689).
 
-    Returns 0 when the position is smaller than one lot (a sub-200 科创板
-    holding cannot be bought up to a valid lot, so it is skipped here).
+    Normal behavior rounds DOWN.  But when the scaled position is at least
+    0.9 lot but not yet a full lot (e.g. 0.90-0.99 lot), round UP to a single
+    lot instead of dropping to 0 — otherwise a stock that "almost" fits a lot
+    gets silently excluded from the target (small-position whole-lot dead zone).
     """
     lot = _lot_size(code)
-    return max(0, int(shares / lot) * lot)
+    lots = shares / lot
+    whole = int(lots)
+    if lots - whole >= 0.9:
+        return (whole + 1) * lot
+    return whole * lot
 
 
 _QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
