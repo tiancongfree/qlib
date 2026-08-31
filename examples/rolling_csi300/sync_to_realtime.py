@@ -631,8 +631,9 @@ def sync_positions(
     #   1) 重新查询真实持仓(权威"已成交数量")  -- 基于成交数量比对, 不依赖脆弱的
     #      F3 委托状态表列名(该表列名/空值在不同券商界面不固定, 判错风险高)
     #   2) 对持仓仍不足目标数量的股票: 撤掉其未成交委托, 重新查最新实时价,
-    #      按同样滑点(0.2%)重新挂单; 只重挂一次(保底), 不无限循环
-    # 卖出同理: 仍在持有但本应在 target 之外的股票, 撤掉未成交 SELL 后重挂.
+    #      改用"对手价"重新挂单(买挂卖一 ask1, 卖挂买一 bid1)提高成交概率,
+    #      盘口价缺失时回退 现价 x(1±slip); 只重挂一次(保底), 不无限循环
+    #      (对手价取自当次腾讯快照的盘口, 一挂即对价成交)
     # ---------------------------------------------------------------------
     if retry_missed and not dry_run:
         print(f"\n{'=' * 60}")
@@ -678,7 +679,9 @@ def sync_positions(
                     fresh_snap = fetch_tencent_snapshot(fresh_codes)
                 else:
                     fresh_snap = {}
-                # 重新挂单(每个未成交目标只重挂一次)
+                # 重新挂单(每个未成交目标只重挂一次). 二轮改用"对手价":
+                # 主动买入挂卖一价(ask1), 主动卖出挂买一价(bid1), 一挂即对价成交;
+                # 盘口价缺失/为0时回退 现价 x(1±slip).
                 for code, residual in miss_buy:
                     ths = _qlib_to_ths(code)
                     # 复选后可能已部分成交, 再查一次避免重复
@@ -686,15 +689,23 @@ def sync_positions(
                     residual = max(0, int(target_stocks.get(code, 0)) - have2)
                     if residual < _lot_size(code):
                         continue
-                    rp = (fresh_snap.get(code) or {}).get("price", 0) or \
-                         ref_prices.get(code, 0)
-                    limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+                    fs = fresh_snap.get(code) or {}
+                    ask = fs.get("ask1", 0) or 0
+                    if ask > 0:
+                        limit_price = round(ask, 2)
+                    else:
+                        rp = fs.get("price", 0) or ref_prices.get(code, 0)
+                        limit_price = round(rp * (1 + price_slippage), 2) if rp else None
                     do("BUY", ths, residual, limit_price)
                 for code, remain in miss_sell:
                     ths = _qlib_to_ths(code)
-                    rp = (fresh_snap.get(code) or {}).get("price", 0) or \
-                         ref_prices.get(code, 0)
-                    limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+                    fs = fresh_snap.get(code) or {}
+                    bid = fs.get("bid1", 0) or 0
+                    if bid > 0:
+                        limit_price = round(bid, 2)
+                    else:
+                        rp = fs.get("price", 0) or ref_prices.get(code, 0)
+                        limit_price = round(rp * (1 - price_slippage), 2) if rp else None
                     do("SELL", ths, remain, limit_price)
                 print(f"{'=' * 60}")
         print()
