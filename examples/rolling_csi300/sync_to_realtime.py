@@ -349,6 +349,8 @@ def sync_positions(
     auction_wait: bool = True,
     mode: str = "daily",
     max_weight: float = 0.15,
+    retry_missed: bool = True,
+    retry_settle_delay: float = 2.0,
 ):
     """
     Compare target vs actual and place buy/sell orders, with an optional
@@ -622,6 +624,81 @@ def sync_positions(
         limit_price = round(rp * (1 + price_slippage), 2) if rp else None
         do("BUY", ths, target_stocks[code], limit_price)
 
+    # ---------------------------------------------------------------------
+    # 二轮保底: 首轮循环里, 一个限价单如果股价在它上方就一直挂着不成交
+    # (典型场景是"低开高走", 限价挂在开盘参考价 x(1+slip), 全天涨过它).
+    # 这里给每只未成交的目标再一次机会:
+    #   1) 重新查询真实持仓(权威"已成交数量")  -- 基于成交数量比对, 不依赖脆弱的
+    #      F3 委托状态表列名(该表列名/空值在不同券商界面不固定, 判错风险高)
+    #   2) 对持仓仍不足目标数量的股票: 撤掉其未成交委托, 重新查最新实时价,
+    #      按同样滑点(0.2%)重新挂单; 只重挂一次(保底), 不无限循环
+    # 卖出同理: 仍在持有但本应在 target 之外的股票, 撤掉未成交 SELL 后重挂.
+    # ---------------------------------------------------------------------
+    if retry_missed and not dry_run:
+        print(f"\n{'=' * 60}")
+        print(f"  二轮保底: 等待 {retry_settle_delay}s 让首轮成交沉淀后复核持仓")
+        _time.sleep(retry_settle_delay)
+        held2 = get_actual_holdings(client)
+        if held2 is None:
+            print("  WARNING: 复查持仓失败, 跳过二轮保底(保持首轮结果).")
+        else:
+            miss_buy, miss_sell = [], []
+            for code in sorted(stocks_to_buy):
+                need = int(target_stocks.get(code, 0))
+                have = int(held2.get(code, 0))
+                lot = _lot_size(code)
+                if have < need and need - have >= lot:
+                    miss_buy.append((code, need - have))
+            for code in sorted(stocks_to_sell):
+                # 卖出未成交 = 仍持有该股(不在 target 却还在账上)
+                if int(held2.get(code, 0)) >= _lot_size(code):
+                    miss_sell.append((code, int(held2.get(code, 0))))
+            if not miss_buy and not miss_sell:
+                print("  无未成交买入/卖出, 无需重挂.")
+            else:
+                if miss_buy:
+                    print(f"  未成交买入 {len(miss_buy)} 只: "
+                          f"{', '.join(f'{c}(余{shares}股)' for c, shares in miss_buy)}")
+                if miss_sell:
+                    print(f"  未成交卖出 {len(miss_sell)} 只: "
+                          f"{', '.join(c for c, _ in miss_sell)}")
+                # 撤单: 只撤这轮要重挂的股票(分买卖类型), 不误撤已成交的
+                miss_codes_buy = [c for c, _ in miss_buy]
+                miss_codes_sell = [c for c, _ in miss_sell]
+                for c in miss_codes_buy:
+                    ths = _qlib_to_ths(c)
+                    client.cancel_order(stock_code=ths, cancel_type="buy")
+                for c in miss_codes_sell:
+                    ths = _qlib_to_ths(c)
+                    client.cancel_order(stock_code=ths, cancel_type="sell")
+                # 重新询价: 只对未成交的股票拉一次批量快照(不再全量, 防止封号/拖慢)
+                fresh_codes = sorted(set(c for c, _ in miss_buy) |
+                                     set(c for c, _ in miss_sell))
+                if fresh_codes:
+                    fresh_snap = fetch_tencent_snapshot(fresh_codes)
+                else:
+                    fresh_snap = {}
+                # 重新挂单(每个未成交目标只重挂一次)
+                for code, residual in miss_buy:
+                    ths = _qlib_to_ths(code)
+                    # 复选后可能已部分成交, 再查一次避免重复
+                    have2 = int(held2.get(code, 0))
+                    residual = max(0, int(target_stocks.get(code, 0)) - have2)
+                    if residual < _lot_size(code):
+                        continue
+                    rp = (fresh_snap.get(code) or {}).get("price", 0) or \
+                         ref_prices.get(code, 0)
+                    limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+                    do("BUY", ths, residual, limit_price)
+                for code, remain in miss_sell:
+                    ths = _qlib_to_ths(code)
+                    rp = (fresh_snap.get(code) or {}).get("price", 0) or \
+                         ref_prices.get(code, 0)
+                    limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+                    do("SELL", ths, remain, limit_price)
+                print(f"{'=' * 60}")
+        print()
+
     # ---- Held stocks in both target & actual: lock quantities (方案 D) ----
     # qlib's TopkDropoutStrategy never rebalances a held stock's share count
     # during a holding period (verified: amount is constant until a re-buy,
@@ -710,6 +787,8 @@ def main(
     obs_log: str = None,
     auction_wait_until: str = "09:30:00",
     auction_wait: bool = True,
+    retry_missed: bool = True,
+    retry_settle_delay: float = 2.0,
 ):
     print("=" * 60)
     print("  Qlib → EasyTHS Real-time Sync")
@@ -849,6 +928,8 @@ def main(
             auction_wait_until=auction_wait_until,
             auction_wait=auction_wait,
             mode=mode,
+            retry_missed=retry_missed,
+            retry_settle_delay=retry_settle_delay,
         )
 
 
