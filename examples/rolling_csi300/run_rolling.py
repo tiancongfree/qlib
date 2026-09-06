@@ -58,9 +58,25 @@ def _find_latest_rolling_exp(handler_class: str = None) -> str:
     if not mlruns_dir.exists():
         return None
     client = mlflow.tracking.MlflowClient(tracking_uri=str(mlruns_dir))
+
+    def _exp_completed_runs(e) -> int:
+        """Number of runs in experiment `e` that have actually produced a
+        pred.pkl artifact (i.e. a fully trained rolling window).  A rolling
+        retrain is only 'complete' when every window turned into a pred; an
+        aborted/interrupted train leaves several windows without pred.pkl."""
+        if os.path.isdir(Path(mlruns_dir) / e.experiment_id):
+            done = 0
+            for run in client.search_runs([e.experiment_id]):
+                if os.path.exists(
+                    Path(mlruns_dir) / e.experiment_id / run.info.run_id / "artifacts" / "pred.pkl"
+                ):
+                    done += 1
+            return done
+        return 0
+
     rolling_exps = [
         e for e in client.search_experiments()
-        if e.name.startswith("rolling_models_")
+        if e.name.startswith("rolling_models_") and e.lifecycle_stage == "active"
     ]
     if not rolling_exps:
         return None
@@ -78,9 +94,24 @@ def _find_latest_rolling_exp(handler_class: str = None) -> str:
         rolling_exps = compatible
     if not rolling_exps:
         return None
-    # Use the one with the latest creation time
-    rolling_exps.sort(key=lambda e: e.creation_time or 0)
-    return rolling_exps[-1].name
+
+    # Favour a *complete* experiment: one whose pred-bearing run count reaches the
+    # maximum seen across candidate experiments (an interrupted retrain leaves a
+    # few windows without pred.pkl, well below the full window count).  Picking the
+    # newest-by-creation-time complete experiment avoids ensembling on a partial /
+    # aborted rolling_models_* that would only cover early dates.
+    counted = [(e, _exp_completed_runs(e)) for e in rolling_exps]
+    max_done = max(c[1] for c in counted) if counted else 0
+    complete = [e for e, n in counted if max_done and n >= max_done]
+    if complete:
+        complete.sort(key=lambda e: e.creation_time or 0)
+        chosen = complete[-1]
+    else:
+        rolling_exps.sort(key=lambda e: e.creation_time or 0)
+        chosen = rolling_exps[-1]
+        print(f"WARNING: no fully-trained rolling experiment found; falling back to "
+              f"{chosen.name} with fewer than a complete set of window preds.")
+    return chosen.name
 
 
 def _expected_handler_class() -> str:
@@ -89,6 +120,35 @@ def _expected_handler_class() -> str:
         yaml = YAML(typ="safe", pure=True)
         conf = yaml.load(f)
     return conf["task"]["dataset"]["kwargs"]["handler"]["class"]
+
+
+def _latest_combined_pred(exp_name: str):
+    """Return the pred of the newest run of the combined experiment, or None.
+
+    In the daily flow, daily_predict.py appends new-day predictions to this run's
+    pred.pkl so that it extends past the last rolling-test window.  Returning it
+    lets the skip-train path merge those extra dates back into the freshly
+    re-ensembled pred instead of dropping them (which would freeze the target).
+    """
+    import pandas as _pd
+    from pathlib import Path as _Path
+    mlruns_dir = _Path(__file__).parent / "mlruns"
+    client = mlflow.tracking.MlflowClient(tracking_uri=str(mlruns_dir))
+    try:
+        exp = client.get_experiment_by_name(exp_name)
+        if exp is None:
+            return None
+        runs = client.search_runs([exp.experiment_id], order_by=["attributes.start_time"])
+        if not runs:
+            return None
+        run = runs[-1]
+        pred_path = mlruns_dir / exp.experiment_id / run.info.run_id / "artifacts" / "pred.pkl"
+        if not pred_path.exists():
+            return None
+        return _pd.read_pickle(pred_path)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"WARNING: could not load existing combined pred for merge: {exc}")
+        return None
 
 
 def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_csi300_lgbm"):
@@ -140,12 +200,6 @@ def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_cs
         if rolling_exp is None:
             print("ERROR: No existing rolling_models_* experiment found. Run without --skip_train first.")
             sys.exit(1)
-        # Remove the old combined experiment so we can write a fresh one
-        try:
-            from qlib.workflow import R
-            R.delete_exp(experiment_name=exp_name)
-        except Exception:
-            pass
         print(f"  Reusing rolling experiment: {rolling_exp}")
 
     rolling = Rolling(
@@ -168,7 +222,16 @@ def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_cs
     if skip_train:
         print("\n  [SKIP TRAIN] Models already trained. Only running ensemble + backtest.")
         print("=" * 60)
-        rolling._ens_rolling()
+        # IMPORTANT (frozen-pred fix): do NOT delete the combined experiment. The
+        # latest combined-run pred.pkl is extended daily by daily_predict.py to the
+        # latest trading day.  Re-ensembling from the rolling (training) models alone
+        # would reset the pred back to the last rolling test window (the retrain
+        # date) and throw away those daily-apended new dates -> the backtest target
+        # freezes and live rebalancing stops.  Instead we merge the rolling ensemble
+        # with any existing (already-extended) combined pred (extra_pred) so the
+        # combined pred keeps advancing.
+        tail_pred = _latest_combined_pred(exp_name)
+        rolling._ens_rolling(extra_pred=tail_pred)
         rolling._update_rolling_rec()
     else:
         task_list = rolling.get_task_list()

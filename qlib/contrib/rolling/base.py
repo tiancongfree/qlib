@@ -215,7 +215,7 @@ class Rolling:
         trainer = TrainerR(experiment_name=self.rolling_exp, call_in_subproc=True)
         trainer(task_l)
 
-    def _ens_rolling(self):
+    def _ens_rolling(self, extra_pred=None):
         rc = RecorderCollector(
             experiment=self.rolling_exp,
             artifacts_key=["pred", "label"],
@@ -224,6 +224,21 @@ class Rolling:
             artifacts_path={"pred": "pred.pkl", "label": "label.pkl"},
         )
         res = rc()
+        if extra_pred is not None:
+            # Preserve any predictions that live beyond what the rolling (training)
+            # ensemble can produce (e.g. dates appended daily by daily_predict.py
+            # between retrains).  Concat, de-dup keeping the latest per
+            # (datetime, instrument), so the combined pred keeps advancing past the
+            # last rolling test window instead of being reset back to it on every
+            # --skip-train run.
+            def _series(x):
+                return x.iloc[:, 0] if hasattr(x, "columns") else x
+            ens_pred = _series(res["pred"]).rename("score")
+            extra = _series(extra_pred).rename("score")
+            merged = pd.concat([ens_pred, extra])
+            merged = merged[~merged.index.duplicated(keep="last")]
+            merged = merged.sort_index().to_frame("score")
+            res["pred"] = merged
         with R.start(experiment_name=self.exp_name):
             R.log_params(exp_name=self.rolling_exp)
             R.save_objects(**{"pred.pkl": res["pred"], "label.pkl": res["label"]})
