@@ -424,7 +424,7 @@ WSL cron 只在 WSL 存活时跑 → 宿主关机 = cron 全错过。现已加 4
 ```bash
 cd examples/rolling_csi300
 
-# 完整训练 + 回测 (约1小时, 依赖 23GB swap)
+# 完整训练 + 回测 (约1小时; full 27窗较吃内存, 建议 .wslconfig 已生效到 24GB; append 轻量单末窗基本不依赖 swap)
 python3 run_rolling.py
 
 # 跳过训练, 复用已有 rolling_models 实验, 只跑 ensemble + 回测
@@ -458,7 +458,9 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 ## 数据/环境备注
 
 - qlib 数据: ~/.qlib/qlib_data/cn_data
-- **当前研究机** (DESKTOP-JTV5CLG, WSL IP 192.168.52.105): 15GB RAM + 23GB swap, 20 线程, 训练峰值依赖 swap 兜底; 回测/研究/模型训练
+- **当前研究机硬件 (重要, 2026-09-07 校正)**: DESKTOP-JTV5CLG; **宿主 Windows 物理 33.9GB (标称 32GB), 20 逻辑核**。本机 Windows 账户 profile 名是中文 `C:\Users\田聪`(不是 tc! tc 只是 WSL Linux 用户名)。WSL2 默认内存上限 = **宿主一半 ~16GB**, 这是旧文档"15GB RAM"的由来(曾把 default WSL 半额误当整机)。
+- **WSL 内存上限由 .wslconfig 控制**: 现已在 `C:\Users\田聪\.wslconfig` 配置 `[wsl2] memory=24GB / processors=20 / swap=8GB`。⚠️ **需 `wsl --shutdown` 重启 WSL 才生效**; 生效前 WSL 仍是 ~15.4GB + 4GiB swap(旧 AGENTS 的 "23GB swap" 是更早那次 reset 前遗留口径, 已作废)。生效后单末窗 append (~13GB 峰值) 基本不再碰 swap。
+- 20 逻辑核全给 WSL(nproc=20); 训练峰值依赖 swap 只在 .wslconfig 未生效/内存给不够时发生。回测/研究/模型训练均在本机。
 - PIT 记录格式: 20 字节 (date+period+value+_next), financial/<code>/<field>_q
 - 日频 bin 与 PIT 逐日一致 (243/243 天验证)
 - tushare 代理: API_URL 默认 http://jiaoch.site, token 从环境变量 `TUSHARE_TOKEN` 读取 (已从代码中移除, 勿硬编码)
@@ -625,6 +627,17 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - (可选) 更高频/另类信号源 (分钟级) — 机构暴力来源, 需新数据
 - (可选) 减少训练窗口减轻 swap 依赖
 
+## 移动训练机 (8GB M1 Mac, Plan B 移动补充) — 2026-09-07 进展
+
+- **目标**: 研究机出走期间能在 8GB M1 跑 append 单末窗(不替代桌面主训练)。计划书 `examples/rolling_csi300/m1_mac_plan.md`。
+- **内存拆解 (2026-09-07 桌面分块 RSS, 单末窗最大窗)**:
+  - num_threads ∈ {2,4,6,8} → **峰值恒定 ~12.7GB**(只变 wall)。降线程救不了内存, 峰值主人是 float64 dataset 链非 boost。
+  - 阶段归因: handler 母体载入 +5.2GB; ds.prepare(train) 物化 122万×356 float64 +4.1GB; lgb.Dataset +1.4GB; boost +1.6GB。合计 ~12.7GB。
+  - **推论**: 唯一现实进 8GB 的主口 = **float64→float32**(L3)。目标把两大块省 ~一半 → ~6.5-7GB(留 ~1GB swap 兜底)。
+- **已定决策**: 缓存 = **A2 Mac 本地重建**(非 scp 桌面 pkl); **允许 float32** 但先在桌面 A/B 验证 pred 一致再铺 M1。
+- **进行中**: 桌面重建 float32 handler 缓存 → 末窗 float32 vs float64 A/B(AGENTS §9 纪律: 同数据同 20 日 label, 只变 float 宽)。完整拆解/杠杆表/分步见 m1_mac_plan.md §0a/§3/§6。
+- **探针干净性**: qlib fit 探针会在 mlruns 留"Experiment"杂目录;已移 `mlruns_cache_probes/`(勿放非数值目录进 mlruns/)。
+
 ## 08-22 冻结 bug 的第二处根因: skip_train 把 daily_predict 延展 pred 覆盖掉 (2026-09-07 修复, 重要)
 
 - **症状**: 244 实盘 2026-09-02/03/04 连续三天 sync 日志 `To sell: 0 / To buy: 0` (target==actual==27), 持仓冻结不出九月决策
@@ -644,7 +657,7 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
   - **真·end-to-end 延展到 9 月待 244 重训模型后首次新数据日回归** (本机无能预测 9 月的完整模型: 最近完整 retrain 为 08-22/08-31, 窗口只到 08 月底; 09-07 自动重训 OOM 半途, 见下)
 - **部署注意**: research 与 244 commit 因 committer 身份不同 SHA 不同 (d3cf4f2a vs d3cf4f2ae), 内容经 sha256 一致; 后续 bundle 对比别再依赖 SHA 相等。
 - **相关半成品运维**: 09-07 07:33 自动 monthly retrain `rolling_models_20260907073326` 因内存 OOM (`BrokenProcessPool`) 只训成 3-4 个 2020 窗口即中断 (无 ens)。已把该实验目录移出 mlruns 至 `examples/rolling_csi300/mlruns_cache_aborted_20260907/` 隔离 (<b>勿把任何目录直接放 `mlruns/` 下非数值名, mlflow 会当实验目录扫)</b>. 生产仍用 `rolling_models_20260822155347` (244) / 本机最新完整 `rolling_models_20260831183707`.
-- **健康度提醒**: 09-07 起研究机 auto-retrain cron 已因 OOM 中招 (AGENTS 记载训练峰值需 ~23GB swap, 现仅 4GiB)。**补跑前先扩 swap** 再跑 monthly_retrain.sh, 否则每次重训都失败 → combined pred 永远停在老模型末端 → 本修复无真 new-data 可用。
+- **健康度提醒**: 09-07 起 auto-retrain cron 曾因 WSL 默认半额内存上限 + 仅 4GiB swap 而 OOM 半途 (`rolling_models_20260907073326` 只训 3-4 窗即中断)。**根修 = WSL 内存上限调高** (见"数据/环境备注": `C:\Users\田聪\.wslconfig` memory=24GB, 须 `wsl --shutdown` 重启才生效)。重启后 append(~13GB 峰值)基本不碰 swap; 若仍受旧默认限制, 训练会失败 → combined pred 停在老模型末端。**若最近一次运行失败, 先重启 WSL 再补跑 monthly_retrain.sh。**
 
 ## 回撤邮件提醒 (dd_alert.py, 2026-08-13)
 
