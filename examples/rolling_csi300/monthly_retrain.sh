@@ -43,9 +43,43 @@ echo ""
 echo "[1/5] Updating qlib data..."
 timeout 900 "$PY" update_baostock.py || echo "  WARN: data update failed, continuing with existing data"
 
+# ---- retrain swap window (on-demand, torn down when retrain exits) ----
+# The heavy run_rolling.py train peaks ~13GB anon in one subprocess.  The host
+# has only a 4GiB /dev/sdc swap active by default, which is not enough -> OOM
+# (BrokenProcessPool, see AGENTS 2026-09-07).  We do NOT keep this swapfile
+# always-on (it would reserve ~20GB disk permanently); instead we activate it
+# for the duration of this retrain run and deactivate before it exits.
+RETRAIN_SWAP=${RETRAIN_SWAP:-/swapfile19G}
+SWAP_DID_ON=""
+
+swapon_has() { swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$1"; }
+
+enable_retrain_swap() {
+    if swapon_has "$RETRAIN_SWAP"; then
+        echo "retrain swap already active: $RETRAIN_SWAP"
+        return
+    fi
+    if [[ -f "$RETRAIN_SWAP" ]] && sudo -n swapon "$RETRAIN_SWAP" 2>/dev/null; then
+        SWAP_DID_ON=1
+        SZ=$(swapon --show=NAME,SIZE --bytes --ifexists 2>/dev/null | awk -v s="$RETRAIN_SWAP" '$1==s{printf "%.1fGB", $2/1e9}')
+        echo "enabled retrain swap: $RETRAIN_SWAP ($SZ)"
+    else
+        echo "WARN: could not enable retrain swap $RETRAIN_SWAP - training may OOM"
+    fi
+}
+
+disable_retrain_swap() {
+    if [[ -n "$SWAP_DID_ON" ]] && swapon_has "$RETRAIN_SWAP"; then
+        sudo -n swapoff "$RETRAIN_SWAP" 2>/dev/null || true
+        echo "retrain swap deactivated: $RETRAIN_SWAP"
+    fi
+}
+
 # ---- 2. full retrain ----
 echo ""
 echo "[2/5] Full rolling retrain (all 27 tasks)..."
+trap 'disable_retrain_swap' EXIT   # tear swap back down no matter how the run ends
+enable_retrain_swap
 "$PY" run_rolling.py --exp-name "$EXP"
 
 # ---- 3. locate new rolling experiment + verify combined pred date ----
@@ -60,6 +94,7 @@ print(exps[-1].name)
 PY
 )
 echo "  new rolling experiment: $NEW_EXP"
+export NEW_EXP   # needed by step [4/5] python (os.environ lookup)
 # combined pred last date
 "$PY" - << 'PY'
 import pandas as pd, glob, os, mlflow
@@ -75,12 +110,13 @@ PY
 # ---- 4. bundle rolling experiment + pred, scp to 244 ----
 echo ""
 echo "[4/5] Bundling rolling experiment + pred -> 244..."
-EXP_ID=$("$PY" - << 'PY'
-import mlflow
+EXP_ID=$("$PY" << PY
+import mlflow, os
 client = mlflow.tracking.MlflowClient()
-e = client.get_experiment_by_name("rolling_models_" + "$NEW_EXP".replace("rolling_models_",""))
-exps = [x for x in client.search_experiments() if x.name == "$NEW_EXP"]
-print(exps[0].experiment_id)
+e = client.get_experiment_by_name(os.environ["NEW_EXP"])
+if e is None:
+    raise SystemExit(f"experiment {os.environ['NEW_EXP']} not found")
+print(e.experiment_id)
 PY
 )
 echo "  rolling exp id: $EXP_ID"
@@ -138,3 +174,9 @@ echo "=============================================="
 echo "Monthly retrain done: $(date)"
 echo "Log: $LOG"
 echo "=============================================="
+
+# Record last successful retrain time (for monthly_retrain_catchup.sh)
+STATE="${STATE:-$LOG_DIR/.last_retrain}"
+printf '%s %s\n' "$(date '+%Y%m%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M')" > "$STATE"
+echo "Wrote last-retrain state: $STATE"
+echo "$(cat "$STATE")"
