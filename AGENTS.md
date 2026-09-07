@@ -61,6 +61,13 @@ WSL cron 只在 WSL 存活时跑 → 宿主关机 = cron 全错过。现已加 4
 - **每月 1/15 号重训** (本机 cron): `monthly_retrain.sh` 完整重训 → 推新 rolling 实验 + 缓存 + pred 到 244
 - **`monitor_ic.py`**: 每日 IC 健康监控 (前瞻20天+因果shift20, 与 ICTiming 同口径), 连续 <0.03 报警
 - **验证**: 修复后 8 月换仓 9 次 (修复前 2 次), 三只目标股全部换出; 本机与 244 pred/指标一致
+- **⚠️ 重训语义已改 (2026-09-07 起, Plan B)**: "每月 1/15 重训" **不再默认跑完整 27 窗**。`monthly_retrain.sh` 默认 `MODE=append` —— 只重训**最新 1 个窗口** (rolling 2008→now, expand-only, `task_l[-1]`) 并 **APPEND 进既存 rolling_models_*** 实验 (不 delete, 不动历史窗 pred)。原理:
+  - 实盘 target 只消费**最新窗** pred (qlib RollingEnsemble concat+dedup 无跨窗平均);LightGBM 无"真在线行更新",每月"权重刷新" ≡ 用 2008→now **全量重拟最新窗一次**。那 ~26 个 2020 起的历史窗每月重跑是纯报告重复功 (pred 冻结即够)。
+  - append 只跑一次最大窗 (~10GB 峰值, 几分钟), 旧 OOM/几十分钟全 27 窗的算力/swap 开销基本去掉。
+- **全量重刷报告 = 手动**: 脚本 **不设自动 full 计时**, 也不依赖 daily catchup 触发 full。需要整段 2020→今 equity/IC/回测重刷时, 手动 `MODE=full bash monthly_retrain.sh` (retrain 全 27 窗)。`monthly_retrain_catchup.sh` (每日 09:00) 仍只判 `logs/.last_retrain` ≥16 天没跑到 → 补跑, 但默认也是 **append**(轻)。
+- **实现 (零改 qlib 源码, 升级安全)**: `examples/rolling_csi300/rolling_append.py` 定义 `class AppendRolling(Rolling)`, 新增方法 `train_append()`: `TrainerR(experiment_name=self.rolling_exp, call_in_subproc=True)([task_l[-1]])` 且 **不调用 `R.delete_exp`** (不像 qlib 原生 `_train_rolling_tasks`)。其余继承父类 `get_task_list/_ens_rolling/_update_rolling_rec`。`run_rolling.py` `--mode {full,append}` (默认 append): append 分支 = resolve 既存 rolling exp → `train_append()` → `_ens_rolling(extra_pred=_latest_combined_pred())` (保留日推 pred 尾, 冻结修复) → `_update_rolling_rec()`; full 分支 = 旧 `rolling.run()` 全量。append/skip 都**必须存在** rolling_models_* (无则报错提示先跑一次 full)。
+- **append 的窗口推进**: 随数据端 60 交易日滑动 → 通常每次 (≥16 天间隔) 只需把最近窗 re-fit 覆盖到当前 calendar 末即可更新模型/pred 尾。若数据连续多次没跨过新 step 边界, 末窗 test 区间不变, 重复二次同一窗 = 无害重复 (dedup keep-latest)。
+- **部署 (append)**: 照旧 push 该 rolling_models_* 实验 (复用, 只是多一个 run) + 新 combined pred 到 244; **缓存 pkl 不动** (append 不重建缓存, 跳过 5.4GB scp; 仅 `MODE=full` 时一并 scp 缓存)。
 
 ### 关键教训
 - **任何"每日流程"必须确认 pred 真的覆盖到最新日期**, 不能只看日志"跑成功"

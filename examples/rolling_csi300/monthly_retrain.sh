@@ -1,20 +1,27 @@
 #!/bin/bash
-# Monthly full retrain for the rolling CSI300 strategy.
+# Monthly (Plan B: default APPEND) retrain for the rolling CSI300 strategy.
 #
 # Runs on the RESEARCH machine (本机, 训练机).  After retraining, pushes the new
-# rolling_models experiment + handler cache + combined pred to the trading box
-# (244) so daily inference / backtest / sync there uses the fresh model.
+# rolling_models experiment + combined pred to the trading box (244) so daily
+# inference / backtest / sync there uses the fresh model.
 #
-# Schedule: monthly on the 1st and 15th (see crontab).
+# Schedule: monthly on the 1st and 15th (see crontab).  Also ~daily catch-up via
+# monthly_retrain_catchup.sh.
 #
-# Flow:
+# Plan B (2026-09-07): by default we run run_rolling.py in APPEND mode - only the
+# newest rolling window (2008->now, expand-only) is retrained and APPENDED to the
+# existing rolling_models_* experiment; older windows stay frozen.  Live target
+# only depends on the newest window, so this is the only work actually needed to
+# refresh the model.  A full rebuild (retrain every window to refresh the whole
+# 2020->today report) is MANUAL:  MODE=full bash monthly_retrain.sh
+#
+# Flow (APPEND):
 #   1. update qlib data from baostock/akshare
-#   2. full retrain (run_rolling.py, no --skip-train) -> new rolling_models_*,
-#      rebuilt handler cache covering latest data, combined pred to latest date
-#   3. bundle the new rolling experiment + updated pred
+#   2. append newest window (run_rolling.py --mode append) into latest
+#      rolling_models_*, re-ensemble combined pred to latest date
+#   3. bundle the reused rolling experiment + updated combined pred
 #   4. scp to 244 Windows desktop -> move into WSL qlib dir
-#   5. scp the 5.4GB handler cache to 244 (full, simplest reliable sync)
-#   6. verify md5 on both sides
+#   5. extract on 244 (cache pkl only rebundled on full / when it changed)
 #
 # NOTE: 244 deploy path uses git bundle for code (daily_predict.py etc.), and
 # scp for data (mlruns experiments + cache pkl).  Update AGENTS.md if changed.
@@ -28,6 +35,12 @@ PY=/home/tc/qlib/.venv/bin/python
 SSH_KEY=~/.ssh/id_ed25519_new
 REMOTE="tc@192.168.11.244"
 EXP=rolling_csi300_lgbm_ndrop1
+
+# MODE: append (default, Plan B) or full (manual - retrain every window).
+MODE="${MODE:-append}"
+if [[ "$MODE" != "append" && "$MODE" != "full" ]]; then
+    echo "Invalid MODE '$MODE' (expected append|full)"; exit 2
+fi
 
 LOG_DIR=/home/tc/qlib/examples/rolling_csi300/logs
 mkdir -p "$LOG_DIR"
@@ -75,25 +88,47 @@ disable_retrain_swap() {
     fi
 }
 
-# ---- 2. full retrain ----
+# ---- 2. retrain (append-only by default) ----
 echo ""
-echo "[2/5] Full rolling retrain (all 27 tasks)..."
+if [[ "$MODE" == "append" ]]; then
+    echo "[2/5] APPEND: retraining ONLY the newest rolling window..."
+else
+    echo "[2/5] FULL: retraining all rolling windows..."
+fi
 trap 'disable_retrain_swap' EXIT   # tear swap back down no matter how the run ends
 enable_retrain_swap
-"$PY" run_rolling.py --exp-name "$EXP"
+"$PY" run_rolling.py --mode "$MODE" --exp-name "$EXP"
 
-# ---- 3. locate new rolling experiment + verify combined pred date ----
+# ---- 3. locate (reused/appended or newly-created) rolling experiment ----
 echo ""
-echo "[3/5] Locating new rolling experiment..."
+echo "[3/5] Locating rolling experiment..."
+# Prefer the experiment whose pred-bearing run count is the highest (an interrupted
+# full retrain leaves only a few window preds and must not win over the exp we just
+# appended to).  Tie-break -> newest creation.  This mirrors run_rolling's
+# _find_latest_rolling_exp so both the trainer and the deploy bundler agree.
 NEW_EXP=$("$PY" - << 'PY'
-import mlflow, pathlib
+import mlflow, pathlib, os
 client = mlflow.tracking.MlflowClient()
-exps = [e for e in client.search_experiments() if e.name.startswith("rolling_models_")]
-exps.sort(key=lambda e: e.creation_time or 0)
-print(exps[-1].name)
+def completed(run_dir):
+    a = pathlib.Path(run_dir) / "artifacts" / "pred.pkl"
+    return a.exists()
+exps = [e for e in client.search_experiments()
+        if e.name.startswith("rolling_models_") and e.lifecycle_stage == "active"]
+best = None
+for e in exps:
+    runs = client.search_runs([e.experiment_id])
+    if not runs:
+        continue
+    base = pathlib.Path("mlruns") / e.experiment_id
+    n = sum(1 for r in runs if completed(base / r.info.run_id))
+    if best is None or n > best["n"] or (n == best["n"] and (e.creation_time or 0) > (best["e"].creation_time or 0)):
+        best = {"e": e, "n": n}
+if best is None:
+    raise SystemExit("no active rolling_models_* experiment found")
+print(best["e"].name)
 PY
 )
-echo "  new rolling experiment: $NEW_EXP"
+echo "  chosen rolling experiment: $NEW_EXP"
 export NEW_EXP   # needed by step [4/5] python (os.environ lookup)
 # combined pred last date
 "$PY" - << 'PY'
@@ -142,14 +177,23 @@ TMP=/tmp/retrain_deploy_$$
 mkdir -p "$TMP"
 tar czf "$TMP/rolling_exp.tar.gz" "mlruns/$EXP_ID"
 tar czf "$TMP/combined_pred.tar.gz" "mlruns/$COMB_ID/$RUN_ID"
-# handler cache (full 5.4GB)
-CACHE=$(ls Alpha158Industry.*.pkl | head -1)
-echo "  cache: $CACHE"
+# handler cache (5.4GB) only needs re-syncing on a FULL rebuild (a new handler cache
+# was written there).  APPEND keeps reusing the existing cache -> skip the big scp.
+if [[ "$MODE" == "full" ]]; then
+    CACHE=$(ls Alpha158Industry.*.pkl | head -1)
+    echo "  cache (full rebuild): $CACHE"
+    SEND_CACHE=1
+else
+    SEND_CACHE=0
+    echo "  cache: unchanged on append (skipping 5.4GB scp)"
+fi
 
 # scp to 244 windows desktop
 scp -i "$SSH_KEY" "$TMP/rolling_exp.tar.gz" "$TMP/combined_pred.tar.gz" "$REMOTE:/C:/Users/tc/Desktop/" || echo "  WARN: scp experiments failed"
-# cache is big; scp separately (about 1-3 min on LAN)
-scp -i "$SSH_KEY" "$CACHE" "$REMOTE:/C:/Users/tc/Desktop/" || echo "  WARN: scp cache failed"
+if [[ "$SEND_CACHE" == "1" ]]; then
+    # cache is big; scp separately (about 1-3 min on LAN)
+    scp -i "$SSH_KEY" "$CACHE" "$REMOTE:/C:/Users/tc/Desktop/" || echo "  WARN: scp cache failed"
+fi
 
 # ---- 5. extract on 244 (WSL) ----
 echo ""
@@ -161,8 +205,10 @@ cp /mnt/c/Users/tc/Desktop/rolling_exp.tar.gz /tmp/ 2>/dev/null
 cp /mnt/c/Users/tc/Desktop/combined_pred.tar.gz /tmp/ 2>/dev/null
 tar xzf /mnt/c/Users/tc/Desktop/rolling_exp.tar.gz -C . 
 tar xzf /mnt/c/Users/tc/Desktop/combined_pred.tar.gz -C .
-cp /mnt/c/Users/tc/Desktop/Alpha158Industry.*.pkl . 
-md5sum Alpha158Industry.*.pkl
+if ls /mnt/c/Users/tc/Desktop/Alpha158Industry.*.pkl >/dev/null 2>&1; then
+    cp /mnt/c/Users/tc/Desktop/Alpha158Industry.*.pkl .
+    md5sum Alpha158Industry.*.pkl
+fi
 echo "--- 244 deployed rolling experiment(s) ---"
 ls -d mlruns/$(grep -l "rolling_models_" mlruns/*/meta.yaml | head -1 | sed 's|mlruns/||;s|/meta.yaml||') 2>/dev/null || true
 EOF

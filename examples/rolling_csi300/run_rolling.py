@@ -26,6 +26,7 @@ from qlib.data import D
 from qlib.contrib.rolling.base import Rolling
 from qlib.utils.pickle_utils import add_safe_class
 import custom_handler  # noqa: F401 - register handler for pickle
+from rolling_append import AppendRolling
 from save_positions import save_positions_to_csv
 
 # Register custom classes so subprocesses can deserialize them
@@ -151,7 +152,8 @@ def _latest_combined_pred(exp_name: str):
         return None
 
 
-def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_csi300_lgbm"):
+def main(skip_train: bool = False, mode: str = "append", conf: str = None,
+         exp_name: str = "rolling_csi300_lgbm"):
     """Run rolling training + backtest.
 
     Parameters
@@ -160,6 +162,17 @@ def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_cs
         If True, skip model training and only re-run ensemble + backtest
         (useful when models are already trained and you only want to re-export
         positions or re-run portfolio analysis with different parameters).
+    mode : str
+        One of "append" (default) or "full".
+        - full   : the old behaviour - retrain EVERY rolling window from scratch
+                   (all ~27 wrapping the 2020->today path). Use to refresh the full
+                   2020->today equity/IC/backtest report.
+        - append : only train the NEWEST rolling window (expand-only), reusing the
+                   existing rolling_models_* experiment without deleting/recreating
+                   it. Old windows' pred stay frozen and keep the historical backtest
+                   continuous. Live target only depends on the newest window, so this
+                   is sufficient for daily serving (see AppendRolling).
+        Ignored when skip_train=True.
     conf : str, optional
         Path to the rolling config yaml. Defaults to ``rolling_config.yaml``.
     exp_name : str
@@ -192,17 +205,27 @@ def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_cs
     if not mlruns.exists():
         os.makedirs(mlruns, exist_ok=True)
 
-    # When skipping training, reuse existing rolling_models experiment
+    # Resolve the rolling_models_* experiment.  append mode (like skip_train) MUST
+    # target an already-existing experiment, because it adds the newest window to the
+    # previously-trained windows rather than rebuilding all of them from scratch.
     rolling_exp = None
-    if skip_train:
+    if skip_train or (not skip_train and mode == "append"):
         handler_class = _expected_handler_class()
         rolling_exp = _find_latest_rolling_exp(handler_class=handler_class)
         if rolling_exp is None:
-            print("ERROR: No existing rolling_models_* experiment found. Run without --skip_train first.")
+            print("ERROR: No existing rolling_models_* experiment found."
+                  + (" Run without --skip_train first." if skip_train
+                     else " Run one full (--mode full) retrain first, then appends "
+                          "(--mode append) can extend it."))
             sys.exit(1)
         print(f"  Reusing rolling experiment: {rolling_exp}")
 
-    rolling = Rolling(
+    if not skip_train and mode == "full":
+        # full rebuild -> start fresh, do not reuse stale windows
+        rolling_exp = None
+
+    _RollingCls = Rolling if mode == "full" else AppendRolling
+    rolling = _RollingCls(
         conf_path=CONF_PATH,
         step=60,         # ~3 months per rolling window (quarterly retraining)
         horizon=20,      # 20-day prediction horizon
@@ -234,14 +257,35 @@ def main(skip_train: bool = False, conf: str = None, exp_name: str = "rolling_cs
         rolling._ens_rolling(extra_pred=tail_pred)
         rolling._update_rolling_rec()
     else:
-        task_list = rolling.get_task_list()
-        print(f"\nTotal rolling tasks to train: {len(task_list)}")
-        for i, t in enumerate(task_list):
-            segs = t["dataset"]["kwargs"]["segments"]
-            print(f"  Task {i+1}: train {segs['train']}, valid {segs['valid']}, test {segs['test']}")
-
-        print("\nStarting rolling training...")
-        rolling.run()
+        if mode == "append":
+            # Plan B: retrain only the newest rolling window (expand-only), appending
+            # to the existing rolling_models_* experiment.  The newest window's pred
+            # is what the live target uses, so this is the only work actually needed
+            # to refresh the model each month; the older windows stay frozen and keep
+            # the 2020->today historical report continuous.
+            task_list = rolling.get_task_list()
+            print(f"\nTotal tasks if full: {len(task_list)} | append: "
+                  f"1 (newest window only)")
+            last = task_list[-1]
+            segs = last["dataset"]["kwargs"]["segments"]
+            print(f"  Appending window: train {segs['train']}, "
+                  f"valid {segs['valid']}, test {segs['test']}")
+            rolling.train_append()
+            # Re-ensemble with any existing (already daily-extended) combined pred so
+            # the daily/appended tail is preserved (frozen-pred fix).  train_append()
+            # only trains; it does NOT ensemble, so do it here.
+            tail_pred = _latest_combined_pred(exp_name)
+            rolling._ens_rolling(extra_pred=tail_pred)
+            rolling._update_rolling_rec()
+        else:  # full -> old behaviour: train every window + ensemble + report.
+            task_list = rolling.get_task_list()
+            print(f"\nTotal rolling tasks to train: {len(task_list)}")
+            for i, t in enumerate(task_list):
+                segs = t["dataset"]["kwargs"]["segments"]
+                print(f"  Task {i+1}: train {segs['train']}, "
+                      f"valid {segs['valid']}, test {segs['test']}")
+            print("\nStarting rolling training...")
+            rolling.run()  # internally ensembles + updates rolling rec for full
 
     print("\nDone! Results saved in mlruns/")
 
