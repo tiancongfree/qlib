@@ -111,9 +111,24 @@ WSL cron 只在 WSL 存活时跑 → 宿主关机 = cron 全错过。现已加 4
 - **症状**: 同一命令多次回测结果不同 (ndrop=1 时 0.183~0.207 波动 ±2.4pp), 持仓在 2022-07-05 等日期分歧
 - **根因**: `qlib/backtest/position.py` `get_stock_list` 用 `list(set(...))` 迭代, set 顺序依赖 PYTHONHASHSEED → 每次进程结果不同
 - **影响**: 仅 n_drop=1 敏感 (每次只换1只, 边界选择对顺序敏感); n_drop>=2 稳定 (已验证 nd2/3/5 复现一致)
-- **修复**: `get_stock_list` 返回前 `stock_list.sort()`, 已 patch 到 qlib 源码 (~/qlib/qlib/backtest/position.py:424)
-- **验证**: patch 后 ndrop=1 连跑两次完全一致; ndrop=2/3/5 结果与 patch 前一致 (无偏差)
+- **修复 (历史)**: `get_stock_list` 返回前 `stock_list.sort()`, 曾 patch 到 qlib 源码 (~/qlib/qlib/backtest/position.py:424)。**2026-09-08 起已改为「纯继承」方案并还原 qlib 源码 patch — 现不再改 qlib 源码 (见下 3b 重构小节)**
+- **验证 (历史)**: patch 后 ndrop=1 连跑两次完全一致; ndrop=2/3/5 结果与 patch 前一致 (无偏差)
 - **教训**: 任何回测对比前必须确认确定性; 早期 n_drop 敏感性结论受此污染
+
+##### 3b 重构 2026-09-08: sort 修复改为纯继承, qlib 源码 patch 已还原 (重要!)
+- **目标**: 彻底不 fork qlib 源码 (position.py)。结论: **可行性成立**, 已落地且验证通过。
+- **机制 (接线链全沿自有 config, 逐环实锤, 非猜测)**:
+  - 新增 `SortedPosition(Position)` 子类 (examples/rolling_csi300/custom_handler.py), 覆写 `get_stock_list` 直接 `sorted(super().get_stock_list())` — 不依赖基类是否有 sort
+  - `rolling_config.yaml` 的 `backtest:` 块加一行 `pos_type: custom_handler.SortedPosition`
+  - 接线: yaml `backtest` 块 → `PortAnaRecord` 存为 `backtest_config` (record_temp.py:435) → `normal_backtest(executor=…, strategy=…, **self.backtest_config)` splat (record_temp.py:488-489) → `qlib.backtest.backtest(pos_type=…)` → `Account` (__init__.py:161-164) → `init_instance_by_config({"class": self._pos_type, …})` (account.py:115-123)
+  - **关键**: `init_instance_by_config` (`qlib/utils/mod.py:97-112`) 只在 `pos_type` **不带点**时才用 Account 硬编码的 `module_path: qlib.backtest.position` 兜底; `custom_handler.SortedPosition` 带点 → `split_module_path` 分出 m_path≠"" → 直接 import `custom_handler` 找该类, 绕过 qlib 模块。硬编码不挡路
+  - **覆盖完整性**: 所有 `get_stock_list()` 都在 Account 产出的同一 `current_position` 上 — qlib `signal_strategy.py:189/195/356` (deepcopy trade_position)、我们 `custom_handler.py` 各 Topk/ICTiming (deepcopy trade_position, 现 class 偏移 ~289→305 附近)、executor `current_position.settle_start/settle_commit`、`calculate_stock_value`; `base.py:71` `trade_position` 属性 = `common_infra.trade_account.current_position`。无任何决策路径自己 new `Position()` (`signal_strategy.py:338` 的 `current: Position()` 只是 **docstring 注解**)
+- **已还原 qlib patch**: `qlib/backtest/position.py:424` 的 `stock_list.sort()` 已删 (基类回到上游原样), 并**验证还原后仍确定性**:
+  - skip_train (exp rolling_csi300_lgbm_ndrop1, ndrop1+ICTiming) 还原前后 report_normal_1day.pkl md5 **都是 `93f5ab7f0d1a88e4`** (还原前含 SortedPosition/含sort patch, 还原后只靠 SortedPosition)
+  - 还原后连跑 3 次 (其中一次 `PYTHONHASHSEED=12345`) 全部 md5=`93f5ab7f0d1a88e4`, **逐字节一致** → 非确定性随 set 顺序消除, 与 hash seed 无关
+- **附带回测数字 (ndrop1+ICTiming, skip_train 2026-09-04)**: 无成本超额 IR 1.347, 含成本净 IR 1.226, 含成本最大回撤 -18.4% — 与既有生产线一致 (无行为改变)
+- **对 244 的价值**: deterministic 位置现在由 **git 管的 custom_handler.py + rolling_config.yaml** 提供, 不再依赖 qlib 源码 patch → 直接掐断 08-04 "漏带 patch 错单" 那类 drift 来源。**部署 244 时须同步这两个文件 (git pull) 且 244 产线也用 rolling_config.yaml**
+- **非确定其余调用点**: set 排序除 `get_stock_list` 外若还有他用需另行评估; 本次核对显示主要入口已闭环
 
 #### 2026-08-04 生产事故: sort patch 未同步到 244 (重要!)
 - **事故**: 244 实盘机 08-04 09:30 自动 flow 下单, 实际买入 12 只 (含宇通 500 股 ¥1.59w), 其中 9 只是非正确 target 的股票

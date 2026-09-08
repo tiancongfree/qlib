@@ -421,7 +421,6 @@ class Position(BasePosition):
 
     def get_stock_list(self) -> List[str]:
         stock_list = list(set(self.position.keys()) - {"cash", "now_account_value", "cash_delay"})
-        stock_list.sort()
         return stock_list
 
     def get_stock_price(self, code: str) -> float:

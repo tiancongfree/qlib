@@ -9,8 +9,23 @@ from qlib.contrib.data.handler import Alpha158
 from qlib.contrib.data.loader import Alpha158DL
 from qlib.contrib.strategy import TopkDropoutStrategy
 from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+from qlib.backtest.position import Position
 from qlib.data import D
 import copy
+
+
+class SortedPosition(Position):
+    """Deterministic-Position subclass of qlib's `Position`.
+
+    qlib's base `Position.get_stock_list()` (position.py) iterates over a python set,
+    whose order depends on PYTHONHASHSEED -> backtest outcomes vary run-to-run for
+    n_drop=1 (see AGENTS.md 3b). We sort the list to make results byte-identical.
+    Selecting this class via `pos_type` in the backtest config lets us avoid patching
+    qlib source.
+    """
+
+    def get_stock_list(self):
+        return sorted(super().get_stock_list())
 
 
 class VolatilityTimingStrategy(TopkDropoutStrategy):
