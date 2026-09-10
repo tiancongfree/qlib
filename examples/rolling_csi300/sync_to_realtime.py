@@ -618,15 +618,22 @@ def sync_positions(
         inst: s["price"] for inst, s in snapshot.items() if s.get("price", 0) > 0
     }
 
+    def _limit_prices(code: str):
+        """(limit_up, limit_down) directly from the Tencent snapshot fields."""
+        s = snapshot.get(code) or snapshot.get(_ths_to_qlib(code)) or {}
+        return s.get("limit_up", 0) or None, s.get("limit_down", 0) or None
+
     # ---- Sell stocks not in target ----
     # 已裁剪名单 (实际持有但被因子裁掉的) 单独标注, 便于复盘
     cut_held = set(cut_codes) & actual_set
     for code in stocks_to_sell_sorted:
         qty = int(actual[code])
         ths = _qlib_to_ths(code)
-        rp = ref_prices.get(code) or ref_prices.get(ths)
-        # sell slightly below reference to fill; if no price, fall back to market
-        limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+        _, limit_price = _limit_prices(code)
+        if not limit_price:
+            rp = ref_prices.get(code) or ref_prices.get(ths)
+            limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+        # sell at 跌停价 so the order crosses the book and fills immediately
         reason = "因子裁剪" if code in cut_held else "qlib调出"
         print(f"  # 卖出原因: {reason}", flush=True)
         do("SELL", ths, qty, limit_price)
@@ -634,9 +641,11 @@ def sync_positions(
     # ---- Buy stocks in target but not in actual ----
     for code in stocks_to_buy_sorted:
         ths = _qlib_to_ths(code)
-        rp = ref_prices.get(code) or ref_prices.get(ths)
-        # buy slightly above reference to fill
-        limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+        limit_price, _ = _limit_prices(code)
+        if not limit_price:
+            rp = ref_prices.get(code) or ref_prices.get(ths)
+            limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+        # buy at 涨停价 so the order crosses the book and fills immediately
         do("BUY", ths, target_stocks[code], limit_price)
 
     # ---------------------------------------------------------------------

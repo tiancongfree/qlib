@@ -188,13 +188,15 @@ _TX_BID1 = 9   # 买一价
 _TX_BIDV1 = 10  # 买一量
 _TX_ASK1 = 19  # 卖一价
 _TX_ASKV1 = 20  # 卖一量
+_TX_LIMIT_UP = 47    # 涨停价 (腾讯直接给出, 不用昨收×比例算)
+_TX_LIMIT_DOWN = 48  # 跌停价
 
 
 def fetch_tencent_snapshot(instruments: list) -> dict:
     """批量抓取腾讯行情快照 (50 只/请求, 全市场一次调用即可).
 
     返回 {qlib_code: {'price','open','preclose','outer','inner',
-                      'bid1','bidv1','ask1','askv1'}}.
+                      'bid1','bidv1','ask1','askv1','limit_up','limit_down'}}.
     """
     import urllib.request
 
@@ -219,7 +221,7 @@ def fetch_tencent_snapshot(instruments: list) -> dict:
             data = urllib.request.urlopen(req, timeout=10).read().decode("gbk")
             for line in data.strip().split(";"):
                 parts = line.split("~")
-                if len(parts) < 25:
+                if len(parts) < 49:
                     continue
                 sym = parts[2]
                 qlib_code = None
@@ -239,6 +241,8 @@ def fetch_tencent_snapshot(instruments: list) -> dict:
                     "bidv1": _f(parts, _TX_BIDV1),   # 买一量 (手)
                     "ask1": _f(parts, _TX_ASK1),
                     "askv1": _f(parts, _TX_ASKV1),   # 卖一量 (手)
+                    "limit_up": _f(parts, _TX_LIMIT_UP),
+                    "limit_down": _f(parts, _TX_LIMIT_DOWN),
                 }
         except Exception:
             continue
