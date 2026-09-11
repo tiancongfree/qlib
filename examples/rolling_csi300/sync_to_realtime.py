@@ -687,15 +687,34 @@ def sync_positions(
                 if miss_sell:
                     print(f"  未成交卖出 {len(miss_sell)} 只: "
                           f"{', '.join(c for c, _ in miss_sell)}")
-                # 撤单: 只撤这轮要重挂的股票(分买卖类型), 不误撤已成交的
-                miss_codes_buy = [c for c, _ in miss_buy]
-                miss_codes_sell = [c for c, _ in miss_sell]
-                for c in miss_codes_buy:
-                    ths = _qlib_to_ths(c)
-                    client.cancel_order(stock_code=ths, cancel_type="buy")
-                for c in miss_codes_sell:
-                    ths = _qlib_to_ths(c)
-                    client.cancel_order(stock_code=ths, cancel_type="sell")
+                # 撤单: 只撤这轮要重挂的股票(分买卖类型), 不误撤已成交的.
+                # 关键: 撤单结果是权威的"是否仍有挂单"信号. 撤单失败 = 已无挂单
+                # = 首轮其实已成交(只是成交回报尚未回显到持仓查询), 必须【跳过重挂】,
+                # 否则会把已成交的买单再买一次(2026-09-11 603986/002027 重复买入事故).
+                # 只有撤单成功(确实撤掉未成交挂单)的股票才允许进入重挂.
+                def _cancel_pending(code, side):
+                    try:
+                        res = client.cancel_order(stock_code=_qlib_to_ths(code),
+                                                  cancel_type=side)
+                        return bool(res.get("success"))
+                    except TradeClientError as e:
+                        print(f"    WARNING: {code} 撤单异常({e}), 保守视为已成交, 跳过重挂.",
+                              flush=True)
+                        return False
+
+                def _split_filled(codes, side):
+                    pending, filled = [], []
+                    for c in codes:
+                        (pending if _cancel_pending(c, side) else filled).append(c)
+                    return pending, filled
+
+                pend_buy, filled_buy = _split_filled([c for c, _ in miss_buy], "buy")
+                pend_sell, filled_sell = _split_filled([c for c, _ in miss_sell], "sell")
+                if filled_buy or filled_sell:
+                    print(f"  撤单失败(视为已成交, 跳过重挂): "
+                          f"买 {filled_buy or '-'} / 卖 {filled_sell or '-'}")
+                miss_buy = [(c, r) for c, r in miss_buy if c in set(pend_buy)]
+                miss_sell = [(c, r) for c, r in miss_sell if c in set(pend_sell)]
                 # 重新询价: 只对未成交的股票拉一次批量快照(不再全量, 防止封号/拖慢)
                 fresh_codes = sorted(set(c for c, _ in miss_buy) |
                                      set(c for c, _ in miss_sell))
@@ -708,9 +727,8 @@ def sync_positions(
                 # 盘口价缺失/为0时回退 现价 x(1±slip).
                 for code, residual in miss_buy:
                     ths = _qlib_to_ths(code)
-                    # 复选后可能已部分成交, 再查一次避免重复
-                    have2 = int(held2.get(code, 0))
-                    residual = max(0, int(target_stocks.get(code, 0)) - have2)
+                    # 已通过撤单成功确认为"仍挂着未成交", 用检测时的缺口 residual 重挂.
+                    # 不再用 held2 重算(它可能因成交回报未回显而偏小, 不能作为权威).
                     if residual < _lot_size(code):
                         continue
                     fs = fresh_snap.get(code) or {}
