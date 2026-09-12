@@ -24,13 +24,14 @@ WSL cron 只在 WSL 存活时跑 → 宿主关机 = cron 全错过。现已加 4
 | **定时期** | 每月 1/15 01:00 | 环境1 cron | 正常重训 `monthly_retrain.sh` |
 | **每日 catchup** | 每天 09:00 | 环境1 cron | `monthly_retrain_catchup.sh` 检查超期则补跑 |
 | **登录 catchup** | 每次登录 tc 会话 | 环境1 `~/.profile` (nohup 后台) | 登录即查, 平时秒退(~7ms) |
-| **宿主轮询** | 环境2 每 30 分钟 | 训练宿主 Windows 计划任务 `Wake_TrainWL_Catchup` | **拉起训练 WSL 跑 catchup** (覆盖"白天关机晚上到家登录") |
+| **宿主登录** | 环境2 用户登录时 | 训练宿主 Windows 计划任务 `wake_train_wsl_onlogon` (LogonTrigger) | **拉起训练 WSL 跑 catchup** (覆盖"白天关机晚上到家登录") |
 
 - **关键文件**:
   - `monthly_retrain.sh` — 成功后写时间戳 `logs/.last_retrain`
   - `monthly_retrain_catchup.sh` — 读 `logs/.last_retrain`, 距上次成功 ≥16 天(默认 `MAX_AGE_DAYS`)则调用 `monthly_retrain.sh`; **flock 锁** `logs/.retrain.lock` 防多触发并发重训
-  - `wake_train_wsl_catchup.bat` (`环境2 Desktop`) — 宿主任务调 `wsl.exe -d Ubuntu -u tc bash -lc "...catchup.sh >> logs/cron_catchup.log"`
-- **宿主任务注册** (`Wake_TrainWL_Catchup`): SCHTASKS `/sc minute /mo 30`, 只在中、非管理员 token 可创建 (onlogon/onstart 需管理员, 会被拒)。含之前一次事故: 测试触发时 state 过期导致 2 个并发重训抢数据 → **已加 flock** + 重置 state=0815
+  - `wake_train_wsl_catchup.bat` (`环境2 Desktop`) — 宿主任务调 `wsl.exe -d Ubuntu -u tc bash -lc "...catchup.sh >> logs/cron_catchup.log"`; 任务以 `-hide` 参数调用 → 经 `wake_train_wsl_hide.vbs` 隐藏窗口运行 (无 pause); 手动双击 (无参数) 保留窗口 + `pause` 便于调试
+- **宿主任务注册** (实际任务名 **`wake_train_wsl_onlogon`**, 非 `Wake_TrainWL_Catchup`): **LogonTrigger** (用户登录触发, 非 `/sc minute /mo 30` 轮询)。注册/改参数需**管理员** token (普通被拒 0x80070005; onlogon/onstart 本就需管理员)。含之前一次事故: 测试触发时 state 过期导致 2 个并发重训抢数据 → **已加 flock** + 重置 state=0815
+- **任务参数 (2026-09-11)**: `wake_train_wsl_onlogon` 的 action `Arguments` 已设 `-hide` (须管理员 PowerShell `Set-ScheduledTask` 改; `schtasks /change /tr` 带引号路径+参数改动无效)。bat 内 `if "%1"=="-hide"` 走隐藏分支
 - **当前 state**: `logs/.last_retrain=20260815` (age≈14d, 正常不补跑)
 
 
@@ -297,17 +298,68 @@ WSL cron 只在 WSL 存活时跑 → 宿主关机 = cron 全错过。现已加 4
 - **结论**: 方向在年份间剧烈翻转 (+6.2pp → -8.5pp) = 高方差非稳定信号; 收益几乎无净改善 (+0.3pp) 却**回撤每年几乎都略差** (2021/2023/2024/2026)。与 §7d-bis 归因完全呼应: 贵价股净贡献≈0、不构成实质亏本 → 剔除无得、反添波动。**不建议纳入生产**；代码/config/实验保留供参考, 未 commit 策略启用 (min 结论同 7e volume: 视觉上"更合理"的改动实测中性偏负)
 - **当前实盘判定 (致函数)**: 20w 模拟盘的整手/贵价闲置是**结构性问题**, 但它**不构成 alpha 损失** (实测贵价股近1年贡献≈0); 模拟盘跑输理论更多来自整手离散噪声+单票集中度, 而非"贵价被丢"。评估模型真实水平仍用多账户回测 (§7c/§7d), 小资金实盘仅作信号健康监控
 
-### 7f. 实盘资金利用率 vs qlib 名义天花板 (2026-09-08 实测, 结论已接受 ~75%)
+### 7f. 实盘资金利用率 (2026-09-08 首测 → 2026-09-11 口径更正, 实测 ~93%)
 
-- **触发**: 用户观察 244 实盘运行多日现金利用率 ~73% (`max_total=total_assets` 下 975k 账户只投 ~716k, 闲置 ¥259k), 怀疑闲置可被"方案D 闲置回补"填满。
-- **实测 (真实账户 read-only dry, 无下单)**: qlib 当日 target **31 只**原始名义 Σ(amount×前复权)≈ **¥2,976,688**; 账户 975k → `_parse` 压缩 **scale≈0.3276**。
-- **口径对账表 (同账户 3 列)**, 正是 75% vs 98% 真相:
-  - **A 严格 qlib 整手**: 存活 24 只, 部署 ¥734,491 = **75.3%** —— 31 只中 **7 只打折到 <1 手被整手归零** (SH688041/SH603986/SZ002916/SZ300308/SZ301308/SZ300502/SH688521, 全高价股, 理想份额合计 ≈ ¥214k ≈ 22% 账户), qlib 从不买它们 → **结构性天花板**。
-  - **B 方案C式** (A + 余钱给高权重各补一手): ¥971,105 = **99.6%**, 但把补到的一批名推到理想权重 **1.11–1.50×** (SZ300274 1.33x / SH688047 1.50x / SH688041 1.24x 等) —— = §7d-bis "方案C 权重畸变"重演。**99.6% 靠违反 qlib 单股权重上限换来**。
-  - **C 无整手下限理想**: 100% (纯基准)。
-- **结论 (固化, 非过拟合)**: 当账户名义(≈回测 account) 显著小于 qlib target 名义(31 只 ~3M) 时, 守 qlib 单股权重的**可投满上限 ≈ 75%**; 想 >90% 必须收窄名单 (target nominal→账户 nominal) 或接受权重超限。今日闲置是**结构性**(高价股整手死角 + 目标名义远大于账户), 非"补/卖订单"能解。既有 top-up/超配回吐两机制实测都能触发但对提投用作用为负 (多换手 + 集中) → **决定接受当前部署**(即 75% 上限为守 qlib 的正常结果), 不启 buy-only top-up 也不启 overweight-trim。
-- **代价注记**: 接受 ~26% 结构性闲置 ≈ 每年 ~几千元现金作不可投余量, 换取不引入每日换手造假与单票集中突刺; 数值债小于方案D 成本。
-- **代码状态**: `sync_to_realtime.py` 的 方案D top-up + `trim_overshoot` 超配回吐 + `[对账天花板]` 诊断均已**开发并本地 commit `e485e860`(snapshot 分支)但未部署 244**; 244 保持 `d3cf4f2ae` (旧文件无此逻辑)。本机该 commit 保留作可复用工具/历史, 后续若启用须先看 true dry-run再批。
+> ⚠️ **口径更正 (2026-09-11, 重要)**: 本节 09-08 首测的 "~75% 天花板" 结论**建立在错误口径上, 已作废**。根因: 用 `Σ(amount × 前复权 close)` 当 "目标名义市值" (≈¥2.97M), 但 qlib 存的前复权价以**上市首日=1** 归一, 与实盘腾讯真实价可差数倍 (例: 600515 前复权 0.70 vs 真实 2.75, ~4x)。前复权口径把目标名义虚高到账户的 ~3 倍, 才得出 "只能投 75%"; **真实价口径下 Σ目标名义 ≈ ¥0.89M, 利用率 93%**。判断实盘利用率必须用**真实价口径** (`Σ(amount×腾讯实时价)` 或持仓 `市值` 字段), 绝不能用 `amount×前复权close`。
+
+- **触发**: 2026-09-11 用户核对 244 实盘持仓, 质疑 "利用率 93% 与 AGENTS '75% 天花板' 矛盾" → 复核证实 93% 为真, 75% 是错口径。
+- **实测 (2026-09-11, 真实账户 read-only)**:
+  - `query_funds`: 总资产 **¥955,725**, 股票市值 **¥889,847**, 现金 ¥65,878 → **利用率 93.1%**
+  - qlib target **31 只**; **真实价口径** Σ(amount×price) ≈ **¥889,847** (= 持仓市值, 自洽); **前复权口径** Σ(amount×前复权close) ≈ **¥2,970,208** (虚高 ~3.3x)
+- **真实缺口 (93% → 满仓)**: 整手化丢 8 只, 合计漏配 **~¥71k (7.4%)**:
+  - **完全没买 (4 只高价股)**: SH688521 芯原 / SZ300502 新易盛 / SZ300308 中际旭创 / SZ002916 深南电路 (各理想 ¥17k-35k, 真实一手价贵被 floor 归零)
+  - **没买满 (4 只)**: SZ000988 华工 0.89x / SZ002384 东山 0.81x / SZ002353 杰瑞 0.78x / SZ002028 思源 0.71x
+- **结论 (固化)**: 守 qlib 单股权重时, 实盘**真实利用率 ≈ 93%** (非 75%); 剩余 ~7% 是整手化离散 + 少数绝对高价股一手配不起所致, **属可忽略量级** (对应 §7d-bis 归因: 贵价股近1年净贡献≈0, 丢它们不构成实质 alpha 损失)。既有 top-up/超配回吐两机制**无必要启用** (93% 已够, 且引入换手/集中)。
+- **代价注记**: 接受 ~7% 结构性闲置 (≈¥66k 现金) 换不引入每日换手造假与单票集中突刺。
+- **代码状态**: `sync_to_realtime.py` 的 方案D top-up + `trim_overshoot` 超配回吐 + `[对账天花板]` 诊断均已**开发并本地 commit `e485e860`(snapshot 分支)但未部署 244**; 244 保持 `d3cf4f2ae`。**注: 该 commit 里的 `[对账天花板]` 诊断也用前复权口径 (hence 报 86.3% 而非真实 93%)** —— 若日后启用须先把诊断口径改为真实价。本机该 commit 保留作可复用工具/历史。
+
+### 7g. 实盘 vs qlib 目标「当日跟踪误差」金额归因方法 (2026-09-12 建立, 可复用)
+
+> **用途**: 每当发现「qlib HTML 日收益」与「实盘真实日收益」对不上时, 用这个**金额口径 (元, 不用 pp)** 的方法把差异拆成: 高价股缺配 / 权重漂移 / sync 执行 / 残差。比 pp 更直观且可直接对账到 broker 的 dayPL。
+
+#### 数据源 (全部 read-only)
+1. **实盘账户** (244 easyths, host 必用 `192.168.11.244:7648`, **不是** 127.0.0.1 — WSL2 独立网络):
+   - `c.query_funds()` → 总资产/股票市值/现金 (利用率)
+   - `c.query_holdings(return_type="json")` → 每只: `股票余额`/`市值`/`市价`(当日收盘)/`成本价`/`当日盈亏`/`当日盈亏比(%)`(=close-to-close 真实收益)
+   - **broker 的 `当日盈亏比(%)` 是 ground truth 收益**, 且**对停牌股也给价** → 弥补 qlib 数据里停牌日无语料的问题
+2. **qlib 目标权重**: `mlruns/<exp_id>/<rid>/artifacts/portfolio_analysis/positions_normal_1day.pkl`
+   - 结构: `{Timestamp: SortedPosition}`, `SortedPosition.position` = `{instrument: {amount, price, weight, count_day}}` (+ 一个 `cash` 标量 key)
+   - **`weight` 是相对「总资产(含现金)」**, 可直接与实盘 `市值/总资产` 比; 不要用 `.cash` 属性/`now_account_value` 方法 (SortedPosition 无前者、后者是 method)
+   - 读该 pkl 需 `sys.path.insert(脚本目录)` 且 cwd 在 `examples/rolling_csi300/` (含 custom_handler 类), 否则 `ModuleNotFoundError`
+   - ── 或被**停牌**则该日无 09-11 价, qlib 重建起点权重会漏掉它们 → **以 broker `市价` 为准**
+3. **归因用收益**: 优先用 broker `当日盈亏比`, qlib-only (未持有) 的名字才用 qlib `$close` 09-10→09-11
+
+#### 方法 (金额口径)
+- `a_total` = 实盘总资产; `mv_start_i = mv_eod_i / (1 + r_broker_i)` (09-10 收盘时的持仓市值, 即 P&L 基准)
+- **qlib 目标 P&L on 实盘资金** = `Σ_i a_total × w_qlib_i × r_i`  (r 用真实收益, 停牌/无语料填 0)
+- **实盘 P&L** = `Σ_i (mv_eod_i − mv_start_i)` (≈ broker `当日盈亏` 合计)
+- **差异分解**:
+  - **(a) 缺配股** = `Σ_{s∉actual} a_total × w_qlib_s × r_s` → 实盘没吃到 (= -a 的损失; 若为正收益股, 就是少赚)
+  - **(b) 权重漂移 (共同持仓)** = `Σ_{s∈common} (w_actual_s − w_qlib_s) × a_total × r_s`
+  - **(c) 残差** = 总差 − (a) − (b)  (停牌/口径/舍入噪声)
+- **sync 执行影响**: 先看 broker `当日买入`/`当日卖出` 合计。**若当日零成交, 则当日盈亏纯持仓浮动, 与 sync 速度/成交价完全无关** (排除此维度)。
+
+#### 首次结论 (2026-09-11 单日, 可作模板)
+- 实盘总资产 ¥955,725 (市值 889,847, 现金 65,878, 利用率 93.1%); qlib 目标 31 只, 实盘 28 项 (交集 26)
+- **qlib 目标 P&L = -9,226 元; 实盘 P&L = -11,599 元 (broker 报 -11,705); 差 = -2,373 元**
+- 拆解:
+  | 来源 | 金额 | 占比 |
+  |---|---|---|
+  | (a) 5 只高价股缺配 (中际旭创+1,145 / 新易盛+572 / 深南+393 / 芯原+127 / 新和成-397) | **-1,842** | **78%** |
+  | (b) 共同持仓权重漂移 (指南针-199 / 海南机场-132 / 拓普-77 …) | **-485** | **20%** |
+  | (c) 停牌/口径残差 | -46 | 2% |
+- **当日零成交** (`当日买入=0 / 当日卖出=0`, qlib report `turnover=0`) → **sync 速度无关**; 损失主要来自隔夜跳空 (前收→开盘 -0.74%, 日内仅 -0.33%)
+- **结论**: 除「整手化不可抗力」(高价配不起 + 取整漂移) 外基本对齐; 若允许非整数手, 实盘约 -9,757 元
+- ⚠️ **口径注意**: qlib HTML 报告 -0.616% (在其 294 万账上 = -18,144 元) 与「目标权重×真实收益 on its own capital」(-28,424 元) 差较多 → **qlib report 的日收益 ≠ 静态目标权重×close-to-close**, 可能含 qlib 内部 close 价/停牌处理/日内路径; 因此归因应用**实盘资金 + broker 真实收益**口径 (如上), 不要拿 qlib report 的 % 直接比。
+
+#### 复用脚本
+- **`attr_daily_tracking.py`** (仓库内, 固化): 一条命令完成上述归因。在 244 (或能连 7648 的机器) 上跑:
+  ```bash
+  cd /home/tc/qlib/examples/rolling_csi300
+  /home/tc/qlib/.venv/bin/python attr_daily_tracking.py --date 2026-09-11 --exp rolling_csi300_lgbm_ndrop1
+  ```
+  输出: qlib 目标 P&L / 实盘 P&L / 差异, 及 (a) 缺配 (b) 权重漂移 (c) 残差 的元金额 + 明细; 并打印当日是否零成交 (判断 sync 是否相关)。
+- 若在别的机器上跑, 用 scp 到 `C:\Users\tc\Desktop\` 再 `wsl -u tc bash -lc "cd /home/tc/qlib/examples/rolling_csi300 && /home/tc/qlib/.venv/bin/python -u /mnt/c/Users/tc/Desktop/attr_daily_tracking.py --date ... --exp ..."` (复杂引号必走脚本文件, 别 inline)
 
 ### 7e. Volume 因子 (VOLUME0-4) → 已存档, 不作为正式配置
 - **动机**: Alpha158 源码里 volume 块 (30 个 rolling 量因子: VMA/VSTD/WVMA/VSUMP/VSUMN/VSUMD) 默认未启用, 想试增量量能信息
@@ -503,6 +555,12 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **操作 WSL 的方式**: 通过 Windows ssh 执行 `wsl -u tc bash -lc '命令'`; 但复杂引号/管道/`&&` 会被 Windows cmd 破坏, **最稳妥 = 把 bash 脚本 scp 到 C:\Users\tc\Desktop 再 `wsl -u tc bash /mnt/c/Users/tc/Desktop/脚本.sh`**
 - **Windows 桌面文件在 WSL 里的路径**: `/mnt/c/Users/tc/Desktop/`
 - **easyths 服务**: 运行在 244 Windows 侧, 端口 7648, config 路径 `C:\ProgramData\miniforge3\Scripts\easyths.exe --config C:\Users\tc\easyths\config.toml`; 当前机器 (52.105) 的 sync_to_realtime.py 连它下单
+- **⚠️ easyths 无自动拉起机制 (2026-09-09 确认, 重要)**: 244 上**不存在 `easyths_server` 计划任务** (schtasks 报"找不到指定文件"), 也没有其他 auto-start。所以一旦 Windows 重启 (更新/断电/手动), easyths 不会自动起来, 下一交易日 09:19 sync 会因连不上 7648 而漏单。
+- **09-09 没调仓根因 (2026-09-09)**: ① 前夜 04:04 244 被 **Windows Update 自动装更新后重启** (Event 1074 svchost+SYSTEM+Service Pack+0x80020010, 干净重启, 无 Kernel-Power 41/无蓝屏); ② 重启后 easyths 没被拉起 (见上一条); ③ 09:19 每日 sync `Connecting to 192.168.11.244:7648` 连续 3 次 timeout → `[sync] FAILED`, **未比较 target/actual 即中断, 一份单没下**; ④ ps1 失败后仍打 "completed successfully" (RestartCmd 分支未武装)。**注意**: 当日策略侧全健康 (数据到 09-08、daily_predict 正常、31 只目标、IC healthy), 纯属 easyths down。**QlibDailyFull 当前实为 Ready** (下次 09-10 09:19 起跑, 与 AGENTS "已禁用"口径矛盾 —— 如需禁请 schtasks /change /tn QlibDailyFull /disable)
+- **244 Windows Update 自动更新已关 (2026-09-09, 用户决定彻底停)**: 写入 `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`:
+  - `NoAutoUpdate = 1` (关自动下载/安装)
+  - `NoAutoRebootWithLoggedOnUsers = 1` (登录时不强制自动重启)
+  - 效果: 不再出现夜里 04:xx 自动重启。**安全补丁以后需手动**去 设置→更新 检查安装。本地策略即时生效, 无需重启。
 - **数据**: 244 的 qlib 数据须定期 `update_baostock.py` 同步 (上次 2026-08-02 更新到 2026-07-31); 更新跑完 dump features 后需确认日历已到最新
 - **Alpha158Industry 缓存** (5.4GB pkl) 已传至 244, 保证两台机器 pred 一致 (0.1pp 内浮点抖动可接受)
 - **WSL 后台任务坑**: nohup 会在 ssh 会话断开时被杀; 必须 `setsid cmd > log 2>&1 < /dev/null &` 才能存活
@@ -548,6 +606,13 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
   - **qlib 无条件卖出不受影响**: 实际持有但不在 target 的照常全卖
   - 一次批量快照同时供 实时价+限价单参考价+近似因子
   - 参数: `--auction-filter False` (**默认关, 只观察, 暂不实际裁剪** — 用户在积累胜率数据后决定是否开启) / `--auction-top-cut 5` / `--retail-exempt-threshold` (默认 None 不豁免)
+  - **胜率观察结果 (2026-09-11 首测, 结论: 正向但样本仍偏短)**: 用 244 实盘 `auction_observe_log.csv` (2026-08-03 ~ 09-10, 14 个交易日, dedup 后 389 行) + 244 最新 qlib open 价算 open→open 前向收益:
+    - **1d**: cut n=130 mean **-1.04%** vs keep n=221 mean **+0.99%** → **keep−cut = +2.03pp**, t-test t=5.17 **p<0.0001**
+    - **3d**: cut -0.46% vs keep +0.67% → +1.13pp; **5d**: cut +0.07% vs keep +0.92% → +0.85pp
+    - **held-only** (would_cut 强制卖): cut -1.24% vs keep +0.88% → +2.12pp; **not-held** (不下单): cut -0.63% vs keep +2.41% → +3.04pp (两子集方向一致)
+    - **per-date**: 12 天中 10 天 keep>cut, 仅 08-03 (-1.0pp)、08-31 (-0.07pp) 反向 → 非单日驱动
+    - **方向支持知乎原文逻辑** (弱开盘/散户买入强的股票确实次日弱): 过滤器**不是**"反着做"
+  - **⚠️ 为何仍未开启 (状态)**: ① 样本仅 ~1.5 个月/14 日, 且 08 月恰逢多日弱势行情, `would_cut` 组负收益可能有 beta 成分, 需更长时间 + 超额(非绝对)口径复核; ② 未做**组合层回测** —— 单股 forward return 正差不等于组合 net alpha (含换手/整手/T+1/被裁后空仓); ③ 裁剪的 18 只多为持仓股 → 强制全卖会显著抬换手. **决定继续观察模式积累样本, 暂不开启 `--auction-filter`**; 复跑命令: `python auction_win_rate.py --log <244的csv> --horizon 1` (注意 local qlib 数据若落后 244, 须在 244 上跑否则前向收益截断)
   - **观察模式 (auction_observe, 默认 True)**: 算因子 + 完整打印"若开启会裁剪谁"的决策 + 把每日决策 append 到 `auction_observe_log.csv`, 但**不修改目标名单** (正常按 qlib 下单)。唯一目的 = 积累胜率统计样本。CSV 列: date/code/auction_buy_strength/retail_sell_strength/would_cut/held; 日后用下日收益对比 would_cut=True vs False 两组算胜率
   - **接口防护 (重要)**: 全流程腾讯行情只调**一次**批量快照 (目标+实际持仓合集, ≤50只/请求), 严禁逐股调用 → 防封号。原 `_load_real_prices` 二次调用已合并
   - **debug 打印 (2026-08-17 加, 因操作者隔日不在场)**: 完整输出因子横截面排序表 (*标末N)、每只裁剪原因 (全卖/跳过/豁免)、卖出原因标注 (因子裁剪 vs qlib调出)、过滤器决策摘要 (候选数/裁剪数/全卖/跳过/豁免/保留数 + [实际执行/仅观察] 标注)
