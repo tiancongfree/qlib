@@ -150,8 +150,9 @@ def download(stock_list, start, end):
     needs no changes.
     """
     lg = bs.login()
-    if lg.error_code != "0":
-        print(f"  baostock login failed: {lg.error_msg}; falling back to akshare Sina...")
+    if lg is None or lg.error_code != "0":
+        msg = getattr(lg, "error_msg", "login returned None (socket reset)")
+        print(f"  baostock login failed: {msg}; falling back to akshare Sina...")
         return download_akshare_sina(stock_list, start, end)
     try:
         # Pre-filter: skip 北交所 stocks (bj.*) which are never selected
@@ -178,16 +179,15 @@ def download(stock_list, start, end):
                         timeout += 1
                         fail += 1
                         print(" TIMEOUT(skip)", flush=True)
-                        # A hung socket poisons the baostock session; re-login to recover.
-                        try:
-                            bs.logout()
-                        except Exception:
-                            pass
-                        lg = bs.login()
-                        if lg.error_code != "0":
-                            raise RuntimeError(f"baostock re-login failed: {lg.error_msg}")
+                        # A hung socket poisons the baostock session; re-login to
+                        # recover. This must never raise: baostock's socket layer
+                        # can return None / throw SystemExit-style errors when the
+                        # server resets the connection, and an uncaught failure here
+                        # used to kill the whole update (2026-09-11: calendar stuck
+                        # at 09-10 before dump_update ran).
+                        _safe_relogin()
                         continue
-                    if rs.error_code != "0":
+                    if getattr(rs, "error_code", "1") != "0":
                         fail += 1
                         print(" FAIL", flush=True)
                         continue
@@ -201,13 +201,13 @@ def download(stock_list, start, end):
                     df["symbol"] = fname.lower()
                     all_data.append(df)
                     print(" OK", flush=True)
-                except Exception:
+                except BaseException as e:  # noqa: BLE001 - never let one stock kill the run
                     fail += 1
-                    print(" ERROR", flush=True)
+                    print(f" ERROR({type(e).__name__})", flush=True)
+                    _safe_relogin()
             progress = min(i + chunk, total)
             print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out)", flush=True)
             time.sleep(0.3)
-        bs.logout()
         if not all_data:
             raise RuntimeError(f"No data downloaded ({fail} failures)")
         print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out)")
@@ -220,13 +220,34 @@ def download(stock_list, start, end):
                 fill = download_akshare_sina(missing, start, end)
                 all_data.extend(fill)
                 print(f"  akshare backfill added {len(fill)} stocks")
-        bs.logout()
+        _safe_logout()
         return all_data
     finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+        _safe_logout()
+
+
+def _safe_logout():
+    """bs.logout() that never raises (socket may be dead/reset)."""
+    try:
+        bs.logout()
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def _safe_relogin():
+    """bs.logout()+login() recovery that never raises.
+
+    Returns True if a fresh baostock session was established. A hung/reset
+    socket can make baostock's layer print "接收数据异常" and return None or
+    throw; swallowing it here keeps the per-stock loop alive instead of
+    aborting the whole update before dump_update writes the calendar.
+    """
+    _safe_logout()
+    try:
+        lg = bs.login()
+    except BaseException:  # noqa: BLE001
+        return False
+    return lg is not None and getattr(lg, "error_code", "1") == "0"
 
 
 def _akshare_sina(sym: str, start: str, end: str, max_retry: int = 5) -> pd.DataFrame:
