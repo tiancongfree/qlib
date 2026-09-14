@@ -340,6 +340,7 @@ def sync_positions(
     dry_run: bool = True,
     max_total: float = None,
     price_slippage: float = 0.002,
+    slippage_deep: float = 0.01,
     auction_filter: bool = False,
     auction_observe: bool = True,
     auction_cut_threshold: float = -50.0,
@@ -618,10 +619,28 @@ def sync_positions(
         inst: s["price"] for inst, s in snapshot.items() if s.get("price", 0) > 0
     }
 
-    def _limit_prices(code: str):
-        """(limit_up, limit_down) directly from the Tencent snapshot fields."""
-        s = snapshot.get(code) or snapshot.get(_ths_to_qlib(code)) or {}
-        return s.get("limit_up", 0) or None, s.get("limit_down", 0) or None
+    # Aggressive "cross-the-book" price for a limit order that MUST fill now.
+    # The broker rejects 涨停/跌停 limit prices ("软件设置不符") and rejects
+    # market orders, so a hard-to-fill order used to sit passively at
+    # 现价×(1±0.2%) and only trade after the price drifted back (603986 09-14
+    # waited 27 min; 601689 several min).  Instead we cross by one tick beyond
+    # the opposing best quote: a sell at ``bid1 - tick`` and a buy at
+    # ``ask1 + tick`` hit the top of the book immediately.  Fall back to a
+    # deeper 现价×(1±slippage_deep) when the book side is missing/zero.
+    def _aggressive_price(code: str, side: str, snap: dict = None):
+        s = (snap or snapshot).get(code) or (snap or snapshot).get(_ths_to_qlib(code)) or {}
+        if side == "SELL":
+            bid = s.get("bid1", 0) or 0
+            if bid > 0:
+                return round(bid - 0.01, 2), "bid1-0.01"
+            rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
+            return (round(rp * (1 - slippage_deep), 2) if rp else None), f"price-{slippage_deep:.1%}"
+        else:
+            ask = s.get("ask1", 0) or 0
+            if ask > 0:
+                return round(ask + 0.01, 2), "ask1+0.01"
+            rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
+            return (round(rp * (1 + slippage_deep), 2) if rp else None), f"price+{slippage_deep:.1%}"
 
     # ---- Sell stocks not in target ----
     # 已裁剪名单 (实际持有但被因子裁掉的) 单独标注, 便于复盘
@@ -629,23 +648,18 @@ def sync_positions(
     for code in stocks_to_sell_sorted:
         qty = int(actual[code])
         ths = _qlib_to_ths(code)
-        _, limit_price = _limit_prices(code)
-        if not limit_price:
-            rp = ref_prices.get(code) or ref_prices.get(ths)
-            limit_price = round(rp * (1 - price_slippage), 2) if rp else None
-        # sell at 跌停价 so the order crosses the book and fills immediately
+        limit_price, src = _aggressive_price(code, "SELL")
+        # sell one tick below bid1 so the order crosses the book and fills now
         reason = "因子裁剪" if code in cut_held else "qlib调出"
-        print(f"  # 卖出原因: {reason}", flush=True)
+        print(f"  # 卖出原因: {reason} (挂价 {limit_price} = {src})", flush=True)
         do("SELL", ths, qty, limit_price)
 
     # ---- Buy stocks in target but not in actual ----
     for code in stocks_to_buy_sorted:
         ths = _qlib_to_ths(code)
-        limit_price, _ = _limit_prices(code)
-        if not limit_price:
-            rp = ref_prices.get(code) or ref_prices.get(ths)
-            limit_price = round(rp * (1 + price_slippage), 2) if rp else None
-        # buy at 涨停价 so the order crosses the book and fills immediately
+        limit_price, src = _aggressive_price(code, "BUY")
+        # buy one tick above ask1 so the order crosses the book and fills now
+        print(f"  # 买入挂价 {limit_price} = {src}", flush=True)
         do("BUY", ths, target_stocks[code], limit_price)
 
     # ---------------------------------------------------------------------
@@ -722,32 +736,22 @@ def sync_positions(
                     fresh_snap = fetch_tencent_snapshot(fresh_codes)
                 else:
                     fresh_snap = {}
-                # 重新挂单(每个未成交目标只重挂一次). 二轮改用"对手价":
-                # 主动买入挂卖一价(ask1), 主动卖出挂买一价(bid1), 一挂即对价成交;
-                # 盘口价缺失/为0时回退 现价 x(1±slip).
+                # 重新挂单(每个未成交目标只重挂一次). 用统一的"穿越盘口"价:
+                # 买挂 ask1+0.01, 卖挂 bid1-0.01, 一挂即对价成交;
+                # 盘口价缺失/为0时回退 现价 x(1±slippage_deep).
                 for code, residual in miss_buy:
                     ths = _qlib_to_ths(code)
                     # 已通过撤单成功确认为"仍挂着未成交", 用检测时的缺口 residual 重挂.
                     # 不再用 held2 重算(它可能因成交回报未回显而偏小, 不能作为权威).
                     if residual < _lot_size(code):
                         continue
-                    fs = fresh_snap.get(code) or {}
-                    ask = fs.get("ask1", 0) or 0
-                    if ask > 0:
-                        limit_price = round(ask, 2)
-                    else:
-                        rp = fs.get("price", 0) or ref_prices.get(code, 0)
-                        limit_price = round(rp * (1 + price_slippage), 2) if rp else None
+                    limit_price, src = _aggressive_price(code, "BUY", snap=fresh_snap)
+                    print(f"  # 二轮买入挂价 {limit_price} = {src}", flush=True)
                     do("BUY", ths, residual, limit_price)
                 for code, remain in miss_sell:
                     ths = _qlib_to_ths(code)
-                    fs = fresh_snap.get(code) or {}
-                    bid = fs.get("bid1", 0) or 0
-                    if bid > 0:
-                        limit_price = round(bid, 2)
-                    else:
-                        rp = fs.get("price", 0) or ref_prices.get(code, 0)
-                        limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+                    limit_price, src = _aggressive_price(code, "SELL", snap=fresh_snap)
+                    print(f"  # 二轮卖出挂价 {limit_price} = {src}", flush=True)
                     do("SELL", ths, remain, limit_price)
                 print(f"{'=' * 60}")
         print()
@@ -785,9 +789,9 @@ def sync_positions(
         lot = _lot_size(code)
         excess_shares = (excess_shares // lot) * lot  # 整手向下取整
         if excess_shares >= lot:
-            limit_price = round(rp * (1 - price_slippage), 2) if rp else None
+            limit_price, src = _aggressive_price(code, "SELL")
             print(f"  # {code}: 实盘权重 {current_weight:.1%} > {max_weight:.0%}, 减仓 {excess_shares} 股 "
-                  f"(市值 {current_value:.0f} → 目标 {target_value:.0f})", flush=True)
+                  f"(市值 {current_value:.0f} → 目标 {target_value:.0f}, 挂价 {limit_price} = {src})", flush=True)
             do("SELL-W", ths, excess_shares, limit_price)
             excess_trim.append(code)
     if not excess_trim:
@@ -851,7 +855,9 @@ def sync_positions(
                           f"(市值 {cv:,.0f}→{tv:,.0f})", flush=True)
                     if reason_idle:
                         used += order_val
-                        do("BUY+", ths, qty, round(rp * (1 + price_slippage), 2) if rp else None)
+                        _lp, _src = _aggressive_price(code, "BUY")
+                        print(f"      BUY+ 挂价 {_lp} = {_src}", flush=True)
+                        do("BUY+", ths, qty, _lp)
                     else:
                         print(f"      (超闲置预算, 跳过 {qty} 股)", flush=True)
                         break
@@ -898,8 +904,9 @@ def sync_positions(
                     sell_lots = (in_excess // _lot_size(code)) * _lot_size(code)
                     print(f"    {code} 现 {have} → 满配 {target_qty} 股, 卖超额 {sell_lots} "
                           f"(市值 {cv:,.0f}→{tv:,.0f})", flush=True)
-                    do("SELL-W", ths, sell_lots,
-                       round(rp * (1 - price_slippage), 2) if rp else None)
+                    _lp, _src = _aggressive_price(code, "SELL")
+                    print(f"      SELL-W 挂价 {_lp} = {_src}", flush=True)
+                    do("SELL-W", ths, sell_lots, _lp)
             else:
                 print(f"     无明显超配(市值之超 <{trim_overshoot:.0%} 或已在目标以下), 超配回吐不触发。")
         else:
@@ -954,6 +961,7 @@ def main(
     dry_run: bool = True,
     invest_ratio: float = 0.95,
     price_slippage: float = 0.002,
+    slippage_deep: float = 0.01,
     auction_filter: bool = False,
     auction_observe: bool = True,
     auction_cut_threshold: float = -50.0,
@@ -1094,6 +1102,7 @@ def main(
             dry_run=dry_run,
             max_total=max_total,
             price_slippage=price_slippage,
+            slippage_deep=slippage_deep,
             auction_filter=auction_filter,
             auction_observe=auction_observe,
             auction_cut_threshold=auction_cut_threshold,
