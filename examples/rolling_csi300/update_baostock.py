@@ -140,6 +140,63 @@ def _query_stock_timeout(bs_sym: str, start: str, end: str, per_stock_timeout: f
     return result.get("rs")
 
 
+# Sentinel results for _query_one_stock, distinguishing the failure modes so the
+# caller can decide whether to retry (timeout/failed) or accept (empty symbol).
+_TIMEOUT = object()
+_FAILED = object()
+_EMPTY = object()
+
+
+def _query_one_stock(bs_sym: str, start: str, end: str):
+    """Query one stock, returning a DataFrame or a sentinel.
+
+    - DataFrame        : success (possibly 0-row -> _EMPTY)
+    - _TIMEOUT         : per-stock wall-clock timeout (socket hung)
+    - _FAILED          : baostock returned error_code != "0" (dead/poisoned session)
+    - _EMPTY           : query ok but no rows in range (delisted / suspended)
+    """
+    rs = _query_stock_timeout(bs_sym, start, end, per_stock_timeout=30)
+    if rs is None:
+        return _TIMEOUT
+    if getattr(rs, "error_code", "1") != "0":
+        return _FAILED
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return _EMPTY
+    return pd.DataFrame(rows, columns=rs.fields)
+
+
+def _retry_missing_baostock(missing, start, end, all_data):
+    """Retry a list of symbols on baostock after a fresh login.
+
+    Returns the list of symbols that are still missing (to hand to the akshare
+    fallback). Appends successes to ``all_data`` in place.
+    """
+    if not missing:
+        return []
+    _safe_relogin()
+    still = []
+    for fname in missing:
+        bs_sym = fname_to_bs(fname)
+        try:
+            df = _query_one_stock(bs_sym, start, end)
+        except BaseException as e:  # noqa: BLE001
+            print(f"    [retry] {fname} ERROR({type(e).__name__})")
+            still.append(fname)
+            continue
+        if df is _EMPTY:
+            continue
+        if df is _TIMEOUT or df is _FAILED or df is None:
+            still.append(fname)
+            continue
+        df["symbol"] = fname.lower()
+        all_data.append(df)
+    print(f"    baostock retry recovered {len(missing) - len(still)}/{len(missing)}")
+    return still
+
+
 def download(stock_list, start, end):
     """Download baostock data for all stocks.
 
@@ -166,60 +223,82 @@ def download(stock_list, start, end):
         fail = 0
         timeout = 0
         chunk = 200
+        # Connection-health watchdog. A single server reset used to poison the
+        # baostock session: the following queries all returned error_code != "0"
+        # (printed "FAIL"), which did NOT trigger a re-login, so every remaining
+        # stock failed with "Broken pipe" and the whole nightly update was lost
+        # (2026-09-14: one reset on sz002696 -> 1795/5561 stocks failed, akshare
+        # backfill crawled delisted codes and the run was killed before dump).
+        # Detect a dead session by consecutive failures and self-heal instead.
+        DEAD_CONN_STREAK = 10
+        MAX_RELOGIN_RETRY = 3
+        streak = 0
+        relogins = 0
         for i in range(0, total, chunk):
             batch = stock_list[i : i + chunk]
             batch_id = i // chunk + 1
             for fname in batch:
                 bs_sym = fname_to_bs(fname)
                 print(f"    [{batch_id}] {fname} ({bs_sym}) ...", end="", flush=True)
-                try:
-                    # adjustflag=2: forward-adjusted (all prices at current level)
-                    rs = _query_stock_timeout(bs_sym, start, end, per_stock_timeout=30)
-                    if rs is None:
-                        timeout += 1
-                        fail += 1
-                        print(" TIMEOUT(skip)", flush=True)
-                        # A hung socket poisons the baostock session; re-login to
-                        # recover. This must never raise: baostock's socket layer
-                        # can return None / throw SystemExit-style errors when the
-                        # server resets the connection, and an uncaught failure here
-                        # used to kill the whole update (2026-09-11: calendar stuck
-                        # at 09-10 before dump_update ran).
-                        _safe_relogin()
-                        continue
-                    if getattr(rs, "error_code", "1") != "0":
-                        fail += 1
-                        print(" FAIL", flush=True)
-                        continue
-                    rows = []
-                    while rs.next():
-                        rows.append(rs.get_row_data())
-                    if not rows:
-                        print(" empty", flush=True)
-                        continue
-                    df = pd.DataFrame(rows, columns=rs.fields)
-                    df["symbol"] = fname.lower()
-                    all_data.append(df)
-                    print(" OK", flush=True)
-                except BaseException as e:  # noqa: BLE001 - never let one stock kill the run
+                # Per-stock attempt with connection-health retry. A stock is
+                # retried after a detected dead connection (bounded), so a single
+                # reset can no longer cascade into losing the rest of the run.
+                df = None
+                for attempt in range(MAX_RELOGIN_RETRY + 1):
+                    try:
+                        df = _query_one_stock(bs_sym, start, end)
+                    except BaseException as e:  # noqa: BLE001
+                        df = _FAILED
+                        print(f" ERROR({type(e).__name__})", end="", flush=True)
+                    if df is None or df is _FAILED or df is _TIMEOUT:
+                        streak += 1
+                        # A long run of failures == the session is dead, not the
+                        # individual symbols. Re-login and retry this same stock.
+                        if streak >= DEAD_CONN_STREAK and attempt < MAX_RELOGIN_RETRY:
+                            print(" [relogin]", end="", flush=True)
+                            if _safe_relogin():
+                                relogins += 1
+                                streak = 0
+                                continue
+                        break
+                    # success
+                    streak = 0
+                    break
+                if df is _TIMEOUT:
+                    timeout += 1
                     fail += 1
-                    print(f" ERROR({type(e).__name__})", flush=True)
-                    _safe_relogin()
+                    print(" TIMEOUT(skip)", flush=True)
+                    continue
+                if df is _FAILED or df is None:
+                    print(" FAIL", flush=True)
+                    fail += 1
+                    continue
+                if df is _EMPTY:
+                    print(" empty", flush=True)
+                    continue
+                df["symbol"] = fname.lower()
+                all_data.append(df)
+                print(" OK", flush=True)
             progress = min(i + chunk, total)
-            print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out)", flush=True)
+            print(f"  Batch {batch_id}: {progress}/{total} ({fail} failed, {timeout} timed out, {relogins} relogins)", flush=True)
             time.sleep(0.3)
         if not all_data:
             raise RuntimeError(f"No data downloaded ({fail} failures)")
-        print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out)")
-        # If too many single-stock failures, fall back to akshare for the losers.
+        print(f"  Downloaded {len(all_data)} stocks, {fail} failures ({timeout} timed out, {relogins} relogins)")
+        # Backfill the losers. Retry baostock first (it is much faster than the
+        # akshare Sina path and most "failures" are connection blips), then fall
+        # back to akshare only for whatever is still missing.
         if fail > 0:
-            print(f"  {fail} stocks failed on baostock; backfilling them via akshare Sina...")
             ok_set = {d["symbol"].iloc[0] for d in all_data}
             missing = [s for s in stock_list if s not in ok_set]
             if missing:
-                fill = download_akshare_sina(missing, start, end)
-                all_data.extend(fill)
-                print(f"  akshare backfill added {len(fill)} stocks")
+                print(f"  {len(missing)} stocks missing; retrying on baostock first...")
+                still = _retry_missing_baostock(missing, start, end, all_data)
+                if still:
+                    print(f"  {len(still)} stocks still missing; backfilling via akshare Sina...")
+                    fill = download_akshare_sina(still, start, end)
+                    all_data.extend(fill)
+                    print(f"  akshare backfill added {len(fill)} stocks")
         _safe_logout()
         return all_data
     finally:
@@ -250,11 +329,14 @@ def _safe_relogin():
     return lg is not None and getattr(lg, "error_code", "1") == "0"
 
 
-def _akshare_sina(sym: str, start: str, end: str, max_retry: int = 5) -> pd.DataFrame:
+def _akshare_sina(sym: str, start: str, end: str, max_retry: int = 2) -> pd.DataFrame:
     """Fetch one stock's daily bars from the akshare Sina source (qfq).
 
     Returns a DataFrame with baostock-compatible columns (same forward-adjusted
     coordinate system). Empty DataFrame on repeated network failure.
+
+    Retries are kept low (delisted/index codes return "No value to decode"
+    deterministically, so retrying them is pure waste) and the backoff is short.
     """
     import akshare as ak
 
@@ -267,13 +349,17 @@ def _akshare_sina(sym: str, start: str, end: str, max_retry: int = 5) -> pd.Data
             if df is not None and not df.empty:
                 return df
         except Exception as e:
-            print(f"      akshare {sym} retry {retries}: {str(e)[:80]}")
+            msg = str(e)
+            # A code with no bars is a permanent condition; don't retry it.
+            if "No value to decode" in msg or "'date'" in msg:
+                return pd.DataFrame()
+            print(f"      akshare {sym} retry {retries}: {msg[:80]}")
         retries += 1
-        time.sleep(1.5 * retries)
+        time.sleep(1.0 * retries)
     return pd.DataFrame()
 
 
-def download_akshare_sina(stock_list, start, end):
+def download_akshare_sina(stock_list, start, end, max_seconds: float = 900.0):
     """Download data for ``stock_list`` via akshare Sina source (qfq fallback).
 
     Returns the same structure as :func:`download`: a list of per-stock
@@ -283,7 +369,9 @@ def download_akshare_sina(stock_list, start, end):
     straight into map_and_scale.
 
     Only the A-share (non-北交所) subset is requested; symbol codes are converted
-    SH600519 -> sh600519 for the Sina API.
+    SH600519 -> sh600519 for the Sina API. A wall-clock deadline bounds the whole
+    fallback so it can never run for hours and get killed before dump_update
+    (2026-09-14: killed at 107/2080 after ~40min, losing the whole update).
     """
     import akshare as ak  # noqa: F401  (imported for its public API below)
 
@@ -292,17 +380,25 @@ def download_akshare_sina(stock_list, start, end):
     if bj_skipped:
         print(f"  [akshare] skipped {bj_skipped} 北交所 stocks")
     total = len(a_share_list)
-    print(f"  [akshare] fetching {total} stocks from Sina (qfq -> {start}..{end})")
+    deadline = time.time() + max_seconds
+    print(f"  [akshare] fetching {total} stocks from Sina (qfq -> {start}..{end}, "
+          f"deadline {max_seconds:.0f}s)")
     all_data = []
     fail = 0
+    done = 0
     for i, fname in enumerate(a_share_list):
+        if time.time() > deadline:
+            print(f"  [akshare] deadline hit after {done}/{total}; "
+                  f"returning {len(all_data)} fetched", flush=True)
+            break
+        done += 1
         sym = fname.lower()  # sh600519 works for stock_zh_a_daily
         print(f"    [{i + 1}/{total}] {fname} ...", end="", flush=True)
         df = _akshare_sina(sym, start.replace("-", ""), end.replace("-", ""))
         if df.empty:
             fail += 1
             print(" FAILED", flush=True)
-            time.sleep(0.5)
+            time.sleep(0.2)
             continue
         # drop any time component -> date string, and coerce to numeric
         df = df.copy()
@@ -594,13 +690,21 @@ def download_new_stocks(new_stocks, end_date: str):
         print(f"  baostock login failed: {lg.error_msg}, skip new-stock download")
         return pd.DataFrame()
     try:
+        streak = 0
         for info in new_stocks:
             bs_sym, start_dt = info["bs_sym"], info["start_dt"]
             try:
                 rs = _bs_query_rows(bs_sym, start_dt, end_date)
                 if rs.error_code != "0":
+                    streak += 1
                     print(f"    {info['fname']}: query failed ({rs.error_msg}), skip")
+                    # Same dead-session watchdog as download(): a few consecutive
+                    # failures mean the socket is poisoned, so re-login to keep the
+                    # remaining new stocks from cascading into failure.
+                    if streak >= 3 and _safe_relogin():
+                        streak = 0
                     continue
+                streak = 0
                 rows = []
                 while rs.next():
                     rows.append(rs.get_row_data())
@@ -847,4 +951,15 @@ def main():
     print("\nDone!")
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # A killed run must exit non-zero so the scheduler/monitor sees the
+        # failure instead of logging "completed successfully" (2026-09-14: the
+        # run was interrupted during akshare backfill yet the ps1 wrapper
+        # reported success because the exception was swallowed).
+        print("\n[update_baostock] INTERRUPTED before completion", file=sys.stderr, flush=True)
+        sys.exit(130)
+    except BaseException as e:  # noqa: BLE001
+        print(f"\n[update_baostock] FAILED: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
