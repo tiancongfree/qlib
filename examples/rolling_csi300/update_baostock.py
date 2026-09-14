@@ -17,6 +17,7 @@ from scripts.dump_bin import DumpDataUpdate
 QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
 LAST_UPDATE_FILE = Path(__file__).parent / ".last_update.txt"
 OVERLAP_DAYS = 5  # enough for ratio computation
+MAX_LAG_LOOKBACK = 90  # only self-heal bins lagging within this many calendar days
 CSI300_MV_THRESHOLD = 500e8  # 500亿流通市值: 大概率进 CSI300 (当前成分股最小约212亿)
 
 def _latest_trading_day() -> datetime:
@@ -97,6 +98,13 @@ def build_existing_last_values(stock_list, calendar):
             "last_factor": factor[bin_idx],
             "last_volume": volume[bin_idx],
             "last_amount": amount[bin_idx],
+            # calendar date of the bin's actual last valid row. bin_idx is a
+            # FILE index (0=header, 1=first data row) and must be translated
+            # through the bin's start calendar index.
+            "last_date": (
+                calendar[bin_start + (bin_idx - 1)]
+                if 0 <= bin_start + (bin_idx - 1) < len(calendar) else None
+            ),
         }
     return results
 
@@ -773,8 +781,11 @@ def map_and_scale(all_dfs, existing, calendar):
         if first_adjclose is None or first_adjclose <= 0:
             skipped += 1
             continue
-        # Find overlap row closest to last_cal
-        overlap = grp[grp["date"] <= last_cal]
+        # Anchor the ratio on THIS bin's actual last date (fallback to calendar
+        # end). Bins can lag the calendar, and using the wrong anchor would
+        # scale new prices by a stale/incorrect ratio.
+        anchor = exist.get("last_date") or last_cal
+        overlap = grp[grp["date"] <= anchor]
         if overlap.empty:
             skipped += 1
             continue
@@ -836,6 +847,168 @@ def map_and_scale(all_dfs, existing, calendar):
     result = pd.DataFrame(rows_out)
     result = result.dropna(subset=["date", "close"])
     return result
+
+
+# ---------------------------------------------------------------------------
+# Correct bin appender (replaces qlib's DumpDataUpdate for existing stocks)
+#
+# qlib's DumpDataUpdate has two defects that silently drop/lose data:
+#   A) It decides "which dates to append" from all.txt's end_datetime, and it
+#      advances that end BEFORE the bin write succeeds.  Once all.txt claims a
+#      date the bin does not actually contain, every later run computes an
+#      empty append set and the stock is frozen forever (dump still logs
+#      0 errors).  Observed 2026-09: all.txt end=09-09 but bin ended 09-07,
+#      for ~5858/6115 stocks.
+#   B) In UPDATE mode _data_to_bin blindly appends to the file tail, assuming
+#      the bin's last row is exactly the day before the first appended date.
+#      When that assumption is broken the appended values are shifted by a day.
+# Both are fixed here by treating the BIN CONTENT as the source of truth:
+#   - determine each stock's actual last calendar index from its own bin,
+#   - append only rows strictly after it, filling any calendar gap with NaN,
+#   - write field-by-field so every field stays row-aligned,
+#   - update all.txt end ONLY after a successful append.
+# ---------------------------------------------------------------------------
+
+DUMP_FIELDS_ORDER = [
+    "open", "high", "low", "close", "volume", "amount",
+    "adjclose", "factor", "change", "vwap",
+]
+
+
+def _read_bin_last_index(feat_dir: Path, fname: str):
+    """Return (start_index, last_idx) of a stock's bins.
+
+    ``start_index`` is the calendar index the bin starts at (stored as the
+    first float32).  ``last_idx`` is the calendar index of the last stored
+    row.  Returns None if the stock has no usable bin yet.
+    """
+    close_path = feat_dir / "close.day.bin"
+    if not close_path.exists():
+        return None
+    arr = np.fromfile(str(close_path), dtype="<f")
+    if len(arr) < 2:
+        return None
+    start = int(arr[0])
+    return start, start + (len(arr) - 1) - 1  # last row index
+
+
+def append_new_data_bins(all_new: pd.DataFrame, calendar) -> dict:
+    """Append new rows to existing stocks' bins, aligned and validated.
+
+    Parameters
+    ----------
+    all_new : DataFrame
+        Long-format rows with columns symbol/date/open/high/low/close/volume/
+        amount/adjclose/factor/change/vwap (symbol lower-case).
+    calendar : list[pd.Timestamp]
+        Current calendar (AFTER the new dates have been appended).
+
+    Returns
+    -------
+    dict
+        ``{"appended": {fname: last_date_str}, "failed": {fname: reason}}``.
+        Only stocks in ``appended`` have had their all.txt end advanced.
+    """
+    cal_index = {pd.Timestamp(d): i for i, d in enumerate(calendar)}
+    appended: dict = {}
+    failed: dict = {}
+
+    for fname, grp in all_new.groupby("symbol"):
+        fname = str(fname).lower()
+        feat_dir = QLIB_DIR / "features" / fname
+        info = _read_bin_last_index(feat_dir, fname)
+        if info is None:
+            failed[fname] = "no close bin"
+            continue
+        start_idx, last_idx = info
+        last_date = calendar[last_idx] if 0 <= last_idx < len(calendar) else None
+
+        grp = grp.sort_values("date")
+        grp = grp[grp["date"].notna()]
+        # de-duplicate by date (keep the latest row) so the appended block has
+        # exactly one row per calendar day
+        grp = grp.drop_duplicates(subset=["date"], keep="last")
+        # rows to write: strictly newer than the bin's actual last day
+        if last_date is not None:
+            new_rows = grp[grp["date"] > last_date]
+        else:
+            new_rows = grp
+        if new_rows.empty:
+            continue
+
+        # index in the calendar where appending begins / ends. Use the actual
+        # last new date (not len(new_rows)) so interior gaps from suspensions
+        # keep the block calendar-aligned.
+        append_from = cal_index.get(pd.Timestamp(new_rows["date"].min()))
+        append_to = cal_index.get(pd.Timestamp(new_rows["date"].max()))
+        if append_from is None or append_to is None:
+            failed[fname] = "new date not in calendar"
+            continue
+        if append_to < append_from:
+            failed[fname] = "inverted date range"
+            continue
+        expected_start = last_idx + 1
+        if append_from != expected_start:
+            # gap between bin tail and first new date -> must pad with NaN so
+            # the written rows stay calendar-aligned (never shift the tail).
+            gap = append_from - expected_start
+        else:
+            gap = 0
+
+        # build the appended block, calendar-aligned across the full span
+        span = [calendar[i] for i in range(append_from, append_to + 1)]
+        block = new_rows.set_index("date").reindex(span)
+        # interior all-NaN rows are legitimate (suspension days); only require
+        # that the block spans exactly the calendar slot we computed
+        if len(block) != (append_to - append_from + 1):
+            failed[fname] = "calendar/row date mismatch"
+            continue
+
+        try:
+            expected_total = (last_idx - start_idx + 1) + 1
+            # pre-validate ALL field bins before writing ANY of them, so a
+            # mismatch can never leave a partially-appended stock
+            to_write = []  # (bin_path, vals)
+            for field in DUMP_FIELDS_ORDER:
+                bin_path = feat_dir / f"{field}.day.bin"
+                if not bin_path.exists():
+                    continue
+                cur = np.fromfile(str(bin_path), dtype="<f")
+                if len(cur) != expected_total:
+                    raise ValueError(
+                        f"{field}.day.bin length {len(cur)} != expected "
+                        f"{expected_total}"
+                    )
+                if field in block.columns:
+                    vals = block[field].to_numpy(dtype="<f")
+                else:
+                    vals = np.full(len(block), np.nan, dtype="<f")
+                if gap > 0:
+                    vals = np.concatenate([np.full(gap, np.nan, dtype="<f"), vals])
+                to_write.append((bin_path, vals))
+            for bin_path, vals in to_write:
+                with bin_path.open("ab") as fp:
+                    vals.astype("<f").tofile(fp)
+            appended[fname] = str(new_rows["date"].max().date())
+        except Exception as e:  # noqa: BLE001
+            failed[fname] = f"{type(e).__name__}: {e}"
+
+    return {"appended": appended, "failed": failed}
+
+
+def _update_all_txt_end(appended: dict):
+    """Advance all.txt end ONLY for stocks whose bins were actually written."""
+    p = QLIB_DIR / "instruments" / "all.txt"
+    if not p.exists() or not appended:
+        return
+    df = pd.read_csv(p, sep="\t", names=["s", "st", "en"], dtype=str)
+    df["_key"] = df["s"].str.strip().str.lower()
+    mask = df["_key"].isin(appended.keys())
+    df.loc[mask, "en"] = df.loc[mask, "_key"].map(appended)
+    df = df.drop(columns=["_key"])
+    df.to_csv(p, sep="\t", header=False, index=False)
+
+
 def main():
     print("=" * 60)
     print("Updating qlib CN data (baostock)")
@@ -867,20 +1040,59 @@ def main():
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
     has_new_day = end.date() > calendar[-1].date()
-    print(f"  Download range: {start_str} -> {end_str} (new trading day: {has_new_day})")
 
-    # Existing-stock incremental update (overlap + new dates)
+    # Existing-stock incremental update (overlap + new dates). Also runs when
+    # the calendar is already current but some bins lag (a previous update
+    # dropped rows) so the corruption can self-heal on a plain re-run.
     new_data = pd.DataFrame()
-    if has_new_day:
-        inst = pd.read_csv(QLIB_DIR / "instruments/all.txt", sep="\t", names=["s", "st", "en"])
-        stock_list = inst["s"].str.strip().str.lower().tolist()
+    inst = pd.read_csv(QLIB_DIR / "instruments/all.txt", sep="\t", names=["s", "st", "en"])
+    stock_list = inst["s"].str.strip().str.lower().tolist()
+
+    # Self-heal detection: find bins that lag the calendar. Delisted stocks
+    # (data frozen 2001-2002, etc.) are ignored via MAX_LAG_LOOKBACK so we
+    # never widen the window to 25 years of history.
+    cutoff = calendar[-1] - timedelta(days=MAX_LAG_LOOKBACK)
+    lagging = []  # (fname, bin_last_date)
+    worst_lag = None
+    for fname in stock_list:
+        # 北交所 (bj.*) is never downloaded (download() filters it out), so it
+        # must not be treated as a self-heal target either.
+        if fname.startswith("bj"):
+            continue
+        info = _read_bin_last_index(QLIB_DIR / "features" / fname, fname)
+        if info is None:
+            continue
+        _, last_idx = info
+        if not (0 <= last_idx < len(calendar)):
+            continue
+        d = calendar[last_idx]
+        if d < cutoff:
+            continue  # delisted / long-dead
+        if d < calendar[-1]:
+            lagging.append((fname, d))
+            if worst_lag is None or d < worst_lag:
+                worst_lag = d
+
+    if has_new_day or lagging:
         print(f"  {len(stock_list)} instruments")
+        if lagging:
+            worst_s = worst_lag.date() if worst_lag is not None else "-"
+            print(f"  Detected {len(lagging)} lagging bins (worst recent: {worst_s}) -> self-heal")
+
         print("  Reading last bin values...")
         existing = build_existing_last_values(stock_list, calendar)
         print(f"  Got last values for {len(existing)} stocks")
-        # 2. Download
+
+        # 2. Download normal window for all stocks
         print(f"\n[2] Downloading baostock data ({start_str} -> {end_str})...")
         all_dfs = download(stock_list, start_str, end_str)
+        # Targeted second pass for lagging stocks (widened range). This keeps
+        # the heavy normal window small while still recovering old gaps.
+        if lagging and worst_lag is not None:
+            lag_codes = [c for c, _ in lagging]
+            lag_start = (worst_lag - timedelta(days=2)).strftime("%Y-%m-%d")
+            print(f"  Re-downloading {len(lag_codes)} lagging stocks ({lag_start} -> {end_str})...")
+            all_dfs = all_dfs + download(lag_codes, lag_start, end_str)
         # 3. Map & scale
         print("\n[3] Mapping and scaling...")
         result_df = map_and_scale(all_dfs, existing, calendar)
@@ -888,12 +1100,16 @@ def main():
         print(f"  Stocks: {result_df['symbol'].nunique()}")
         if not result_df.empty:
             print(f"  Date range: {result_df['date'].min().date()} -> {result_df['date'].max().date()}")
-        new_data = result_df[result_df["date"] > calendar[-1]]
-        print(f"  New rows (after {calendar[-1].date()}): {len(new_data)}")
-        if not new_data.empty:
-            print(f"  New dates: {sorted(new_data['date'].unique())[:5]} ...")
+        # Keep the whole overlap range: the per-stock appender filters by each
+        # bin's ACTUAL last day, so a stock lagging further back than
+        # calendar[-1] still gets all of its missing days (not just the newest).
+        new_data = result_df[result_df["date"] > calendar[-1] - timedelta(days=MAX_LAG_LOOKBACK)]
+        strict_new = result_df[result_df["date"] > calendar[-1]]
+        print(f"  New rows (after {calendar[-1].date()}): {len(strict_new)}")
+        if not strict_new.empty:
+            print(f"  New dates: {sorted(strict_new['date'].unique())[:5]} ...")
     else:
-        print(f"  No new trading day (calendar: {calendar[-1].date()}), only processing new stocks")
+        print(f"  No new trading day (calendar: {calendar[-1].date()}), no lagging bins")
 
     # New-stock full history (IPO -> end) mapped into qlib coordinates
     new_stock_data = pd.DataFrame()
@@ -903,48 +1119,87 @@ def main():
         if not new_stock_data.empty:
             print(f"  New-stock rows: {len(new_stock_data)}, stocks: {new_stock_data['symbol'].nunique()}")
 
-    all_new = pd.concat([new_data, new_stock_data], ignore_index=True)
-    if all_new.empty:
+    if new_data.empty and new_stock_data.empty:
         print("No new data and no new stocks. Already up to date!")
         _write_last_update(end)
         print(f"  Last update record saved: {end.strftime('%Y-%m-%d')}")
         return
-    # 5. Save CSVs
-    print("\n[4] Saving CSVs for dump_update...")
-    tmpdir = Path(tempfile.mkdtemp(prefix="qlib_upd_"))
-    csv_dir = tmpdir / "csv"
-    csv_dir.mkdir(parents=True)
-    for fname, grp in all_new.groupby("symbol"):
-        fpath = csv_dir / f"{fname}.csv"
-        grp.to_csv(fpath, index=False)
-    n_files = len(list(csv_dir.glob("*.csv")))
-    print(f"  Saved {n_files} CSVs to {csv_dir}")
-    # 6. Run dump_update
-    print("\n[5] Running dump_update...")
-    du = DumpDataUpdate(
-        data_path=str(csv_dir),
-        qlib_dir=str(QLIB_DIR),
-        freq="day",
-        max_workers=8,
-        date_field_name="date",
-        file_suffix=".csv",
-        symbol_field_name="symbol",
-        exclude_fields="symbol,date",
-    )
-    du.dump()
-    # 7. Verify
+
+    # 5. Extend the calendar first (bins are addressed by calendar index), then
+    #    append existing stocks' rows with our aligned/validated appender.
+    #    New stocks keep using qlib's DumpDataUpdate (they have no bin yet, so
+    #    its append-only path is correct for them).
+    if not new_data.empty:
+        print("\n[4] Extending calendar...")
+        cal_new = sorted(set(calendar) | set(pd.Timestamp(d) for d in new_data["date"].unique()))
+        np.savetxt(str(QLIB_DIR / "calendars/day.txt"), [d.strftime("%Y-%m-%d") for d in cal_new],
+                   fmt="%s", encoding="utf-8")
+        print(f"  Calendar: {calendar[-1].date()} -> {cal_new[-1].date()} ({len(cal_new)} days)")
+        calendar = cal_new
+
+        print("\n[5] Appending existing stocks' bins (content-aligned)...")
+        res = append_new_data_bins(new_data, calendar)
+        _update_all_txt_end(res["appended"])
+        print(f"  Appended: {len(res['appended'])} stocks")
+        if res["failed"]:
+            print(f"  FAILED: {len(res['failed'])} stocks (all.txt end NOT advanced)")
+            for k, v in list(res["failed"].items())[:10]:
+                print(f"    - {k}: {v}")
+
+    if not new_stock_data.empty:
+        print("\n[5b] Dumping new stocks (full history) via DumpDataUpdate...")
+        tmpdir = Path(tempfile.mkdtemp(prefix="qlib_upd_"))
+        csv_dir = tmpdir / "csv"
+        csv_dir.mkdir(parents=True)
+        for fname, grp in new_stock_data.groupby("symbol"):
+            grp.to_csv(csv_dir / f"{fname}.csv", index=False)
+        print(f"  Saved {len(list(csv_dir.glob('*.csv')))} CSVs to {csv_dir}")
+        du = DumpDataUpdate(
+            data_path=str(csv_dir),
+            qlib_dir=str(QLIB_DIR),
+            freq="day",
+            max_workers=8,
+            date_field_name="date",
+            file_suffix=".csv",
+            symbol_field_name="symbol",
+            exclude_fields="symbol,date",
+        )
+        du.dump()
+
+    # 6. Verify
     print("\n[6] Verification...")
     cal_new = read_calendar()
-    print(f"  Old: {calendar[-1].date()} ({len(calendar)} days)")
-    print(f"  New: {cal_new[-1].date()} ({len(cal_new)} days)")
-    print(f"  Added: {len(cal_new) - len(calendar)} days")
-    # Quick load test
-    sys.path.insert(0, str(Path.home() / "qlib"))
-    from qlib import auto_init
-    from qlib.data import D
-    auto_init(provider_uri=str(QLIB_DIR), region="cn")
-    cal = D.calendar()
-    print(f"  Qlib calendar: {cal[0].date()} -> {cal[-1].date()} ({len(cal)} days)")
+    print(f"  Calendar now ends: {cal_new[-1].date()} ({len(cal_new)} days)")
+
+    # independence check: how many relevant stocks' close bin reaches the
+    # calendar end? bj.* is excluded (never downloaded) and delisted stocks
+    # are excluded (data legitimately frozen long ago).
+    last_ts = cal_new[-1]
+    reach = 0
+    total = 0
+    recent_miss = 0
+    for feat_dir in (QLIB_DIR / "features").iterdir():
+        if not feat_dir.is_dir():
+            continue
+        fname = feat_dir.name
+        if fname.startswith("bj"):
+            continue
+        info = _read_bin_last_index(feat_dir, fname)
+        if info is None:
+            continue
+        total += 1
+        start_idx, last_idx = info
+        if not (0 <= last_idx < len(cal_new)):
+            continue
+        d = cal_new[last_idx]
+        if d == last_ts:
+            reach += 1
+        elif d >= last_ts - timedelta(days=MAX_LAG_LOOKBACK):
+            recent_miss += 1
+    print(f"  Stocks with bin reaching {last_ts.date()}: {reach}/{total} (non-bj)")
+    if recent_miss:
+        print(f"  WARNING: {recent_miss} non-bj stocks still lag within {MAX_LAG_LOOKBACK}d")
+
     # Save last update date
     _write_last_update(end)
     print(f"  Last update record saved: {end.strftime('%Y-%m-%d')}")
