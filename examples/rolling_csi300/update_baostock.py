@@ -214,9 +214,9 @@ def download(stock_list, start, end):
     data is in the same forward-adjusted coordinate system and map_and_scale
     needs no changes.
     """
-    lg = bs.login()
+    lg = _login_with_timeout(60)
     if lg is None or lg.error_code != "0":
-        msg = getattr(lg, "error_msg", "login returned None (socket reset)")
+        msg = getattr(lg, "error_msg", "login timed out/returned None (socket reset)")
         print(f"  baostock login failed: {msg}; falling back to akshare Sina...")
         return download_akshare_sina(stock_list, start, end)
     try:
@@ -239,8 +239,15 @@ def download(stock_list, start, end):
         # backfill crawled delisted codes and the run was killed before dump).
         # Detect a dead session by consecutive failures and self-heal instead.
         DEAD_CONN_STREAK = 10
+        # A half-degraded session (many timeouts but occasional OKs) never hit
+        # the consecutive streak threshold, yet throughput collapses and the
+        # update crawls for hours (2026-09-15). Also refresh the session when
+        # the recent failure rate is high even if not strictly consecutive.
+        DEAD_CONN_WINDOW = 20      # look at the last N completed stocks
+        DEAD_CONN_WINDOW_HITS = 8  # relogin if >= this many failed in-window
         MAX_RELOGIN_RETRY = 3
         streak = 0
+        recent = []  # rolling outcomes: True=success, False=failure
         relogins = 0
         for i in range(0, total, chunk):
             batch = stock_list[i : i + chunk]
@@ -260,17 +267,29 @@ def download(stock_list, start, end):
                         print(f" ERROR({type(e).__name__})", end="", flush=True)
                     if df is None or df is _FAILED or df is _TIMEOUT:
                         streak += 1
+                        recent.append(False)
+                        del recent[:-DEAD_CONN_WINDOW]
+                        window_hits = recent.count(False)
                         # A long run of failures == the session is dead, not the
                         # individual symbols. Re-login and retry this same stock.
-                        if streak >= DEAD_CONN_STREAK and attempt < MAX_RELOGIN_RETRY:
-                            print(" [relogin]", end="", flush=True)
+                        dead = streak >= DEAD_CONN_STREAK
+                        degraded = (
+                            len(recent) >= DEAD_CONN_WINDOW
+                            and window_hits >= DEAD_CONN_WINDOW_HITS
+                        )
+                        if (dead or degraded) and attempt < MAX_RELOGIN_RETRY:
+                            tag = "relogin" if dead else "relogin(window)"
+                            print(f" [{tag}]", end="", flush=True)
                             if _safe_relogin():
                                 relogins += 1
                                 streak = 0
+                                recent.clear()
                                 continue
                         break
                     # success
                     streak = 0
+                    recent.append(True)
+                    del recent[:-DEAD_CONN_WINDOW]
                     break
                 if df is _TIMEOUT:
                     timeout += 1
@@ -313,27 +332,66 @@ def download(stock_list, start, end):
         _safe_logout()
 
 
-def _safe_logout():
-    """bs.logout() that never raises (socket may be dead/reset)."""
+def _call_with_timeout(fn, timeout: float):
+    """Run ``fn`` in a daemon thread, abandoning it if it blocks past timeout.
+
+    baostock's ``login``/``logout`` are unguarded blocking socket calls: when the
+    server is half-dead they can block indefinitely inside ``recv`` (observed
+    2026-09: a relogin froze the entire update for 3+ hours with the process
+    stuck in ``bs.logout``). ``try/except`` cannot interrupt a blocked socket, so
+    run the call on a throwaway thread and give up waiting after ``timeout``.
+
+    Returns ``(completed, result)`` -- ``completed`` is False on timeout.
+    """
+    import threading
+
+    box = {}
+
+    def _run():
+        try:
+            box["val"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["err"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return False, None
+    if "err" in box:
+        raise box["err"]
+    return True, box.get("val")
+
+
+def _safe_logout(timeout: float = 30):
+    """bs.logout() that neither raises nor hangs (socket may be dead/reset)."""
     try:
-        bs.logout()
+        _call_with_timeout(bs.logout, timeout)
     except BaseException:  # noqa: BLE001
         pass
 
 
+def _login_with_timeout(timeout: float = 60):
+    """bs.login() guarded by a wall-clock timeout.
+
+    Returns the login result object, or None on timeout/exception.
+    """
+    try:
+        _ok, lg = _call_with_timeout(bs.login, timeout)
+    except BaseException:  # noqa: BLE001
+        return None
+    return lg if _ok else None
+
+
 def _safe_relogin():
-    """bs.logout()+login() recovery that never raises.
+    """bs.logout()+login() recovery that never raises and never hangs.
 
     Returns True if a fresh baostock session was established. A hung/reset
-    socket can make baostock's layer print "接收数据异常" and return None or
-    throw; swallowing it here keeps the per-stock loop alive instead of
-    aborting the whole update before dump_update writes the calendar.
+    socket can make baostock's layer print "接收数据异常" and either return None
+    or block inside login; the timeout keeps the per-stock loop alive.
     """
     _safe_logout()
-    try:
-        lg = bs.login()
-    except BaseException:  # noqa: BLE001
-        return False
+    lg = _login_with_timeout(60)
     return lg is not None and getattr(lg, "error_code", "1") == "0"
 
 
@@ -521,9 +579,10 @@ def sync_csi300_instruments(end_date: str) -> bool:
     - Otherwise: just extend the current segment's end to end_date.
     """
     print("\n[0.6] Syncing csi300 constituents (semi-annual rebalance)...")
-    lg = bs.login()
-    if lg.error_code != "0":
-        print(f"  baostock login failed: {lg.error_msg}, skip")
+    lg = _login_with_timeout(60)
+    if lg is None or lg.error_code != "0":
+        msg = getattr(lg, "error_msg", "login timed out")
+        print(f"  baostock login failed: {msg}, skip")
         return False
     try:
         return _sync_csi300_logged_in(end_date)
@@ -599,9 +658,10 @@ def sync_new_stocks(end_date: str):
     Returns list of dicts: {fname, bs_sym, start_dt, mv}.
     """
     print("\n[0.5] Syncing new stocks (IPO discovery)...")
-    lg = bs.login()
-    if lg.error_code != "0":
-        print(f"  baostock login failed: {lg.error_msg}, skip")
+    lg = _login_with_timeout(60)
+    if lg is None or lg.error_code != "0":
+        msg = getattr(lg, "error_msg", "login timed out")
+        print(f"  baostock login failed: {msg}, skip")
         return []
     try:
         return _sync_new_stocks_logged_in(end_date)
@@ -678,8 +738,8 @@ def _bs_query_rows(bs_sym, start_date, end_date):
             bs.logout()
         except Exception:
             pass
-        lg = bs.login()
-        if lg.error_code != "0":
+        lg = _login_with_timeout(60)
+        if lg is None or lg.error_code != "0":
             return rs
         rs = _query()
     return rs
@@ -693,9 +753,10 @@ def download_new_stocks(new_stocks, end_date: str):
     Returns a DataFrame with the same schema as map_and_scale output.
     """
     rows_out = []
-    lg = bs.login()
-    if lg.error_code != "0":
-        print(f"  baostock login failed: {lg.error_msg}, skip new-stock download")
+    lg = _login_with_timeout(60)
+    if lg is None or lg.error_code != "0":
+        msg = getattr(lg, "error_msg", "login timed out")
+        print(f"  baostock login failed: {msg}, skip new-stock download")
         return pd.DataFrame()
     try:
         streak = 0
