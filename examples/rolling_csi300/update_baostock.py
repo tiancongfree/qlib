@@ -73,7 +73,7 @@ def build_existing_last_values(stock_list, calendar):
         factor = np.fromfile(str(feat_dir / "factor.day.bin"), dtype='<f')
         volume = np.fromfile(str(feat_dir / "volume.day.bin"), dtype='<f')
         amount = np.fromfile(str(feat_dir / "amount.day.bin"), dtype='<f')
-        if len(adj) < 3 or len(close) != len(adj):
+        if len(adj) < 2 or len(close) != len(adj):
             continue
         bin_start = int(adj[0])
         bin_idx = len(adj) - 1  # actual last row of this bin

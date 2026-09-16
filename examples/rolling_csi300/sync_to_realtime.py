@@ -352,6 +352,7 @@ def sync_positions(
     max_weight: float = 0.15,
     retry_missed: bool = True,
     retry_settle_delay: float = 2.0,
+    topup_enabled: bool = False,
     topup_idle_ratio: float = 0.05,
     topup_min_lot_gap: int = 1,
     trim_overshoot: float = 0.10,
@@ -423,6 +424,12 @@ def sync_positions(
     auction_wait : bool
         Enable the wait. Default True (scheduled runs start 09:19; the snapshot
         must be taken inside the auction window for the factors to be valid).
+    topup_enabled : bool
+        Master switch for the 方案D top-up + overweight-trim routine. Default
+        False (disabled): held quantities stay locked exactly as 方案D intends,
+        so the sync only ever acts on qlib target changes (n_drop=1 -> at most a
+        few names/day), never on whole-lot drift. Set True to re-enable the
+        batch reconciliation (idle-cash top-up + ≥trim_overshoot overweight trim).
     topup_idle_ratio : float
         Fraction of ``max_total`` that must sit as idle (un-invested) cash for the
         方案D/回补 routine to re-scale under-allocated held positions back up to
@@ -819,7 +826,7 @@ def sync_positions(
     #     超出可用现金的单若被券商拒, 和现有 BUY 一样打印 FAIL, 不阻塞其余成交。
     #   效果: 换血/收缩/回调造成的大额闲置能一次性拉回满配, 之后小粒度漂移由 qlib 名单
     #   变动消化; 不每天为价格噪音买卖。
-    if max_total and max_total > 0:
+    if topup_enabled and max_total and max_total > 0:
         _invested_now = sum(
             int(actual[c]) * (ref_prices.get(c) or ref_prices.get(_qlib_to_ths(c)) or 0)
             for c in actual
@@ -971,6 +978,7 @@ def main(
     auction_wait: bool = True,
     retry_missed: bool = True,
     retry_settle_delay: float = 2.0,
+    topup_enabled: bool = False,
     topup_idle_ratio: float = 0.05,
     topup_min_lot_gap: int = 1,
     trim_overshoot: float = 0.10,
@@ -1113,6 +1121,7 @@ def main(
             mode=mode,
             retry_missed=retry_missed,
             retry_settle_delay=retry_settle_delay,
+            topup_enabled=topup_enabled,
             topup_idle_ratio=topup_idle_ratio,
             topup_min_lot_gap=topup_min_lot_gap,
             trim_overshoot=trim_overshoot,
