@@ -263,6 +263,63 @@ def _parse_target_stocks(
     return result
 
 
+def _dead_cash(
+    target: pd.DataFrame,
+    target_stocks: dict,
+    max_total: float,
+    ref_prices: dict,
+) -> tuple:
+    """Estimate the structurally un-investable cash and the resulting top-up room.
+
+    The authoritative "what can actually be deployed" figure is already produced
+    by :func:`_parse_target_stocks`: ``Σ target_stocks[c] * real_price`` is the
+    most that whole-lot + real-price constraints allow under qlib's weights.
+    Anything above that is *dead cash* — money that no rebalancing can put to
+    work while strictly following the weights:
+
+        dead_cash   = max_total − Σ(target_stocks[c] × price)
+        topup_room  = max_total − dead_cash − invested = Σ(target_stocks×price) − invested
+                    = idle − dead_cash
+
+    ``target_stocks`` already embeds the whole-lot floor, so this is free of the
+    scale/weight mismatch a per-name ``max_total×weight`` estimate suffers.
+
+    Returns ``(dead_cash, detail)`` where ``detail`` is a per-name breakdown of
+    the source of the dead zone, for diagnostics:
+    ``(code, intended_value, dead_value, reason)``.
+    """
+    if not max_total or max_total <= 0 or target is None or target.empty:
+        return 0.0, []
+    deployable = sum(
+        int(target_stocks[c]) * (ref_prices.get(c) or ref_prices.get(_qlib_to_ths(c)) or 0)
+        for c in target_stocks
+    )
+    dead_total = max_total - deployable
+    detail = []
+    for idx, row in target.iterrows():
+        code = idx[0]
+        w = row.get("weight")
+        if w is None or w <= 0:
+            continue
+        intended = max_total * float(w)
+        rp = ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
+        if not rp or rp <= 0:
+            detail.append((code, intended, intended, "no_real_price"))
+            continue
+        lot = _lot_size(code)
+        lot_cost = rp * lot
+        if lot_cost <= 0:
+            continue
+        if code not in target_stocks:
+            # floor threw the whole name away -> cannot afford even one lot
+            detail.append((code, intended, intended, f"1lot={lot_cost:,.0f}>intended"))
+        else:
+            actual = int(target_stocks[code]) * rp
+            if intended - actual > 0:
+                detail.append((code, intended, intended - actual, "sub_lot_remainder"))
+    return dead_total, detail
+
+
 def _append_obs_log(
     obs_log: str,
     target: pd.DataFrame,
@@ -353,7 +410,6 @@ def sync_positions(
     retry_missed: bool = True,
     retry_settle_delay: float = 2.0,
     topup_enabled: bool = False,
-    topup_idle_ratio: float = 0.05,
     topup_min_lot_gap: int = 1,
     trim_overshoot: float = 0.10,
 ):
@@ -430,14 +486,6 @@ def sync_positions(
         so the sync only ever acts on qlib target changes (n_drop=1 -> at most a
         few names/day), never on whole-lot drift. Set True to re-enable the
         batch reconciliation (idle-cash top-up + ≥trim_overshoot overweight trim).
-    topup_idle_ratio : float
-        Fraction of ``max_total`` that must sit as idle (un-invested) cash for the
-        方案D/回补 routine to re-scale under-allocated held positions back up to
-        their qlib target. Default 0.05 (5%). Idle = max_total minus the real
-        market value of every currently-held stock (pre-run snapshot). A low idle
-        (~a few %) is normal whole-lot granularity and is deliberately left alone;
-        only a material cash pile (e.g. from a T+1 rebalance that could not re-deploy
-        same day) triggers reconciliation. See the 方案D回补 block.
     topup_min_lot_gap : int
         Minimum lots of under-allocation required to top up a single held name
         (default 1 lot). Prevents repeatedly spending a single-lot every run on
@@ -816,13 +864,15 @@ def sync_positions(
     # 闲置现金会一路累积(实测出现 26% 仓位空转)。
     #
     # 回补规则(保守, 不破坏 方案D 去噪本意):
-    #   * 只在「可用闲置现金 ≥ topup_idle_ratio×max_total」时触发 —— 一点整手零头闲置
-    #     (百分之几) 是正常粒度, 故意不动、避免每天多买一手;
+    #   * 触发条件 = 每天动态算出的「可补闲置」> 0 —— 见 _dead_cash: 可补闲置 =
+    #     闲置现金 − 结构性死钱(目标里一手都配不起的整笔 + 其它股的整手零头)。
+    #     死钱再多都不是"该投没投", 天天用固定 5% 门槛会误触发却无事可做, 故改为
+    #     按当日真实可动用的现金判断;
     #   * 对每只 已持仓且在目标 里、且现持股数低于 _parse_target_stocks 给出的满配整手
     #     目标 的股票, 按缺口≥topup_min_lot_gap 整手向上补买到目标;
     #     满配目标 target_stocks[code] 与新建仓买入用的是同一套换算(scale=max_total/总真实市值),
     #     所以回补金额天然受 max_total 约束, 不会超额;
-    #   * 补买预算上限 = 闲置现金, 大权重仓优先(与新建 BUY 的 heavy-first 一致);
+    #   * 补买预算上限 = 可补闲置, 大权重仓优先(与新建 BUY 的 heavy-first 一致);
     #     超出可用现金的单若被券商拒, 和现有 BUY 一样打印 FAIL, 不阻塞其余成交。
     #   效果: 换血/收缩/回调造成的大额闲置能一次性拉回满配, 之后小粒度漂移由 qlib 名单
     #   变动消化; 不每天为价格噪音买卖。
@@ -832,7 +882,27 @@ def sync_positions(
             for c in actual
         )
         idle = max_total - _invested_now
-        triggers = idle >= topup_idle_ratio * max_total
+
+        # Dynamic top-up room.  ``dead`` is the structurally un-investable cash
+        # (whole-lot dead zone); ``topup_room = idle - dead`` is the cash that
+        # can actually be put to work.  This replaces the old hard-coded
+        # ``topup_idle_ratio`` trigger: dead cash is a floor no rebalancing can
+        # touch, so a fixed 5% threshold fires every day yet can do nothing.
+        dead, dead_detail = _dead_cash(target, target_stocks, max_total, ref_prices)
+        topup_room = idle - dead
+        if dead_detail:
+            print(f"\n  [死钱估算] 结构性无法投入 ≈ {dead:,.0f} "
+                  f"(={dead/max_total:.1%} 总资产; 逐股 {len(dead_detail)} 只):")
+            for code, intended, dv, reason in sorted(dead_detail, key=lambda x: -x[2])[:10]:
+                print(f"    {code}: 应投 {intended:,.0f}, 死钱 {dv:,.0f} ({reason})")
+            if len(dead_detail) > 10:
+                print(f"    ... 其余 {len(dead_detail) - 10} 只")
+            print(f"  [方案D回补] 可补空间 = 闲置 {idle:,.0f} − 死钱 {dead:,.0f} "
+                  f"= {topup_room:,.0f} ({topup_room/max_total:+.1%})")
+
+        # Trigger: there is genuinely startable cash AND at least one
+        # under-allocated target holding.  No percentage gate.
+        triggers = topup_room > 0
         if triggers:
             under = []
             for code in sorted(stocks_in_both, key=lambda c: (-_weight(c), c)):
@@ -845,10 +915,11 @@ def sync_positions(
                     cv = have * rp
                     tv = target_qty * rp
                     under.append((code, have, target_qty, cv, tv))
-            print(f"\n  [方案D回补] 闲置现金 {idle:,.0f} ({idle/max_total:.1%}) "
-                  f"≥ {topup_idle_ratio:.0%}, 触发低配回补。低配持仓 {len(under)} 只:")
-            if under:
-                budget = idle
+            if not under:
+                print(f"    无可补低配持仓, 本次不回补 (可补空间 {topup_room:,.0f} 保留)。")
+            else:
+                print(f"    可补空间 {topup_room:,.0f}, 低配持仓 {len(under)} 只:")
+                budget = topup_room
                 used = 0.0
                 for code, have, need, cv, tv in under:
                     lot = _lot_size(code)
@@ -866,11 +937,9 @@ def sync_positions(
                         print(f"      BUY+ 挂价 {_lp} = {_src}", flush=True)
                         do("BUY+", ths, qty, _lp)
                     else:
-                        print(f"      (超闲置预算, 跳过 {qty} 股)", flush=True)
+                        print(f"      (超可补闲置预算, 跳过 {qty} 股)", flush=True)
                         break
                 print(f"  回补申报总额 ≈ {used:,.0f} (预算 {budget:,.0f})")
-            else:
-                print(f"    无满足『缺口≥{topup_min_lot_gap} 手』的低配持仓, 本次不回补低配。")
 
             # ---- 同一次 高闲置 事件里的「超配回吐」: SELL 掉对 qlib 满配目标明显超配
             # (市值 ≥ (1+overshoot)×目标) 的已持在目标股的整手超配额。
@@ -878,7 +947,7 @@ def sync_positions(
             #         超配名"(相对缩水后的目标超额多占资金)。只 buy 低配无法消化超配占住的
             #         钱 → 闲置永远降不到位, 集中度也偏离 qlib。
             #   保守边界(避免破坏 方案D 锁仓去噪本意):
-            #     * 只在 闲置≥ratio 的同一个异常事件里做, 价格噪声那点零头根本不触发该分支;
+            #     * 只在 可补闲置>0 的同一个异常事件里做, 价格噪声那点零头根本不触发该分支;
             #     * 只 SELL 整手、市值偏差 ≥ overshoot(默认10%)以上才动, 不精确贴齐;
             #     * SELL 不回买(卖到 target 为止)、绝不动 stocks_to_sell(已剔的交给主流程),
             #       逐日不 churn(某天价格微小起伏不会让 10% 偏向翻转)。
@@ -917,19 +986,17 @@ def sync_positions(
             else:
                 print(f"     无明显超配(市值之超 <{trim_overshoot:.0%} 或已在目标以下), 超配回吐不触发。")
         else:
-            print(f"  [方案D回补] 闲置 {idle:,.0f} ({idle/max_total:.1%}) < "
-                  f"{topup_idle_ratio:.0%}, 不回补 (整手粒度内正常)。")
+            print(f"  [方案D回补] 无可补空间 (闲置 {idle:,.0f} − 死钱 {dead:,.0f} "
+                  f"= {topup_room:,.0f} ≤ 0, 已投满/略超), 不回补。")
 
         # ---- 部署天花板报告 (整手 floor 语义, 仅诊断, 不下单) ----
-        # qlib 目标是 topk 相对权重; _parse 整手 floor 后 sum(target 满配市值) ≤ max_total。
-        # 多余现金(≈ max_total − 该和)在"跟随 qlib 权重 + 整手下限"下**无处安放**,
-        # 属结构余量, 不是 bug —— 用 `last|满配总市值/总资产` 让操作者看清能投到多满。
-        _deploy_sum = sum(
-            int(target_stocks[c]) * (ref_prices.get(c) or ref_prices.get(_qlib_to_ths(c)) or 0)
-            for c in target_stocks
-        )
+        # 满配可投 = max_total − dead (dead 主要由"一手都配不起"的贵价股 +
+        # 各股整手零头构成)。用 `满配/总资产` 让操作者看清能投到多满; 其余为结构余量。
+        _deploy_sum = max_total - dead
         print(f"\n  [对账天花板] 满配目标总市值 ≈ {_deploy_sum:,.0f} / 总资产 {max_total:,.0f} "
               f"= {_deploy_sum / max_total:.1%} (整手下限下可量化投满的上限; 其余为结构余量)")
+        print(f"  当前已投 {_invested_now:,.0f} ({_invested_now/max_total:.1%}), "
+              f"可补空间 {topup_room:,.0f} ({topup_room/max_total:+.1%})")
 
     # ---- 过滤器决策摘要 (便于复盘) ----
     if need_factors and cut_codes:
@@ -979,7 +1046,6 @@ def main(
     retry_missed: bool = True,
     retry_settle_delay: float = 2.0,
     topup_enabled: bool = False,
-    topup_idle_ratio: float = 0.05,
     topup_min_lot_gap: int = 1,
     trim_overshoot: float = 0.10,
 ):
@@ -1122,7 +1188,6 @@ def main(
             retry_missed=retry_missed,
             retry_settle_delay=retry_settle_delay,
             topup_enabled=topup_enabled,
-            topup_idle_ratio=topup_idle_ratio,
             topup_min_lot_gap=topup_min_lot_gap,
             trim_overshoot=trim_overshoot,
         )

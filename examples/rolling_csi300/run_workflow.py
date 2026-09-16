@@ -62,6 +62,7 @@ def main(
     dry_run: bool = False,
     invest_ratio: float = 0.95,
     skip_update: bool = False,
+    topup_enabled: bool = True,
 ):
     steps = []
 
@@ -75,6 +76,7 @@ def main(
             "--api-key", api_key,
             "--exp-name", exp_name,
             "--invest-ratio", str(invest_ratio),
+            "--topup_enabled", str(topup_enabled),
         ]
         if dry_run:
             cmd += ["--dry-run", "True"]
@@ -125,6 +127,7 @@ def main(
             "--api-key", api_key,
             "--exp-name", exp_name,
             "--invest-ratio", str(invest_ratio),
+            "--topup_enabled", str(topup_enabled),
         ]
         if dry_run:
             cmd += ["--dry-run", "True"]
