@@ -18,6 +18,12 @@ QLIB_DIR = Path.home() / ".qlib/qlib_data/cn_data"
 LAST_UPDATE_FILE = Path(__file__).parent / ".last_update.txt"
 OVERLAP_DAYS = 5  # enough for ratio computation
 MAX_LAG_LOOKBACK = 90  # only self-heal bins lagging within this many calendar days
+# Stocks we already tried to self-heal but whose bin did NOT advance (suspended /
+# delisted / no upstream data).  Stored as {code: bin_last_date_at_attempt}.  A
+# stock is skipped only while its bin still shows that exact same last date, so
+# it self-re-enables the moment real data appears (bin advances -> date differs).
+LAG_ATTEMPTS_FILE = Path(__file__).parent / ".lag_attempts.json"
+
 CSI300_MV_THRESHOLD = 500e8  # 500亿流通市值: 大概率进 CSI300 (当前成分股最小约212亿)
 
 def _latest_trading_day() -> datetime:
@@ -47,6 +53,23 @@ def _read_last_update() -> datetime | None:
 
 def _write_last_update(d: datetime):
     LAST_UPDATE_FILE.write_text(d.strftime("%Y-%m-%d"))
+
+def _read_lag_attempts() -> dict:
+    """Return {code: last_bin_date_str} for stocks whose self-heal already failed."""
+    if LAG_ATTEMPTS_FILE.exists():
+        try:
+            import json
+            return json.loads(LAG_ATTEMPTS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def _write_lag_attempts(d: dict):
+    import json
+    # Drop entries whose bin has since advanced past the recorded date, so the
+    # file does not grow unbounded and stocks re-enter self-heal when revived.
+    LAG_ATTEMPTS_FILE.write_text(json.dumps(d, sort_keys=True))
+
 def read_calendar():
     cal = pd.read_csv(QLIB_DIR / "calendars/day.txt", header=None).iloc[:, 0].tolist()
     return [pd.Timestamp(d) for d in cal]
@@ -1111,10 +1134,17 @@ def main():
 
     # Self-heal detection: find bins that lag the calendar. Delisted stocks
     # (data frozen 2001-2002, etc.) are ignored via MAX_LAG_LOOKBACK so we
-    # never widen the window to 25 years of history.
+    # never widen the window to 25 years of history.  Additionally, a stock
+    # whose bin was already self-healed once at the SAME last date is skipped:
+    # that means upstream has no new data for it (suspended / delisted), so
+    # retrying every day only re-downloads 6000 stocks and stalls the morning
+    # run.  The skip clears automatically if the bin later advances.
     cutoff = calendar[-1] - timedelta(days=MAX_LAG_LOOKBACK)
+    lag_attempts = _read_lag_attempts()
     lagging = []  # (fname, bin_last_date)
     worst_lag = None
+    skipped_stuck = 0
+    attempted_now = {}
     for fname in stock_list:
         # 北交所 (bj.*) is never downloaded (download() filters it out), so it
         # must not be treated as a self-heal target either.
@@ -1130,9 +1160,17 @@ def main():
         if d < cutoff:
             continue  # delisted / long-dead
         if d < calendar[-1]:
+            if lag_attempts.get(fname) == d.strftime("%Y-%m-%d"):
+                skipped_stuck += 1
+                attempted_now[fname] = d.strftime("%Y-%m-%d")
+                continue
             lagging.append((fname, d))
+            attempted_now[fname] = d.strftime("%Y-%m-%d")
             if worst_lag is None or d < worst_lag:
                 worst_lag = d
+    if skipped_stuck:
+        print(f"  Skipping {skipped_stuck} stuck bins (heal already tried at same date)")
+    _write_lag_attempts(attempted_now)
 
     if has_new_day or lagging:
         print(f"  {len(stock_list)} instruments")
