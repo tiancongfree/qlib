@@ -124,12 +124,19 @@ def _expected_handler_class() -> str:
 
 
 def _latest_combined_pred(exp_name: str):
-    """Return the pred of the newest run of the combined experiment, or None.
+    """Return the pred carrying the FURTHEST tail in the combined experiment, or None.
 
-    In the daily flow, daily_predict.py appends new-day predictions to this run's
-    pred.pkl so that it extends past the last rolling-test window.  Returning it
-    lets the skip-train path merge those extra dates back into the freshly
-    re-ensembled pred instead of dropping them (which would freeze the target).
+    In the daily flow, daily_predict.py writes new-day predictions into a new run
+    of this experiment (so that the tail extends past the last rolling-test
+    window).  Returning it lets the skip-train path merge those extra dates back
+    into the freshly re-ensembled pred instead of dropping them (which would
+    freeze the target).
+
+    Selection is by the max datetime actually present in each run's pred.pkl, NOT
+    by ``attributes.start_time``: a freshly created ensemble run may carry a
+    shorter tail (right after a retrain the newest rolling window only covers a
+    couple of days), while an older run holds the daily-appended tail.  Picking by
+    start_time would read the shorter one and the target would jump back.
     """
     import pandas as _pd
     from pathlib import Path as _Path
@@ -140,13 +147,21 @@ def _latest_combined_pred(exp_name: str):
         if exp is None:
             return None
         runs = client.search_runs([exp.experiment_id], order_by=["attributes.start_time"])
-        if not runs:
-            return None
-        run = runs[-1]
-        pred_path = mlruns_dir / exp.experiment_id / run.info.run_id / "artifacts" / "pred.pkl"
-        if not pred_path.exists():
-            return None
-        return _pd.read_pickle(pred_path)
+        best_pred, best_last = None, None
+        for run in runs:
+            pred_path = mlruns_dir / exp.experiment_id / run.info.run_id / "artifacts" / "pred.pkl"
+            if not pred_path.exists():
+                continue
+            try:
+                df = _pd.read_pickle(pred_path)
+                if isinstance(df, _pd.DataFrame):
+                    df = df.iloc[:, 0]
+                last = _pd.Timestamp(df.index.get_level_values("datetime").max())
+            except Exception:
+                continue
+            if best_last is None or last > best_last:
+                best_pred, best_last = df, last
+        return best_pred
     except Exception as exc:  # pragma: no cover - defensive
         print(f"WARNING: could not load existing combined pred for merge: {exc}")
         return None

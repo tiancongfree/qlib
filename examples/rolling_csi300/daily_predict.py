@@ -69,6 +69,40 @@ def _load_newest_model_run(client, exp_name: str):
     return exp_name, model
 
 
+def _pred_last_date(pred) -> pd.Timestamp:
+    return pd.Timestamp(pred.index.get_level_values("datetime").max())
+
+
+def _select_run_by_pred_tail(client, experiment_id: str):
+    """Return the run whose pred.pkl reaches the FURTHEST date.
+
+    Select by the max datetime actually present in each run's pred.pkl, NOT by
+    ``attributes.start_time``.  The start_time ordering is unreliable: a fresh
+    daily/ensemble run may be created with a *shorter* tail (e.g. right after a
+    retrain the newest rolling window only covers a couple of days) while an
+    older run carries the daily-appended tail.  Picking by start_time would then
+    read the stale/shorter pred and the target would jump back.
+
+    Returns (run, pred) or (None, None) if no run has a readable pred.pkl.
+    """
+    runs = client.search_runs([experiment_id], order_by=["attributes.start_time"])
+    best_run, best_pred, best_last = None, None, None
+    for run in runs:
+        p = Path("mlruns") / experiment_id / run.info.run_id / "artifacts" / "pred.pkl"
+        if not p.exists():
+            continue
+        try:
+            df = pd.read_pickle(p)
+            if isinstance(df, pd.DataFrame):
+                df = df.iloc[:, 0]
+            last = _pred_last_date(df)
+        except Exception:
+            continue
+        if best_last is None or last > best_last:
+            best_run, best_pred, best_last = run, df, last
+    return best_run, best_pred
+
+
 def _compute_features(start, end):
     """Compute features on the fly for the window (no cache dependency).
 
@@ -95,6 +129,7 @@ def main(
     end: str = None,
     dry_run: bool = False,
     min_rows: int = 50,
+    in_place: bool = False,
 ):
     auto_init(provider_uri="~/.qlib/qlib_data/cn_data", region="cn")
     from qlib.data import D
@@ -105,13 +140,13 @@ def main(
     comb = client.get_experiment_by_name(exp_name)
     if comb is None:
         raise RuntimeError(f"combined experiment {exp_name} not found")
-    runs = client.search_runs([comb.experiment_id], order_by=["attributes.start_time"])
-    latest = runs[-1]
+    # Select the run carrying the FURTHEST pred tail (not the newest start_time):
+    # a just-created run may have a shorter tail than an older daily-extended one.
+    latest, pred = _select_run_by_pred_tail(client, comb.experiment_id)
+    if latest is None:
+        raise RuntimeError(f"no readable pred.pkl in experiment {exp_name}")
     comb_dir = Path("mlruns") / comb.experiment_id / latest.info.run_id / "artifacts"
     pred_path = comb_dir / "pred.pkl"
-    if not pred_path.exists():
-        raise RuntimeError(f"no pred.pkl at {comb_dir}")
-    pred = pd.read_pickle(pred_path)
     if isinstance(pred, pd.DataFrame):
         pred = pred.iloc[:, 0]
     last_date = pred.index.get_level_values("datetime").max()
@@ -165,7 +200,24 @@ def main(
     combined = combined[~combined.index.duplicated(keep="last")]
     combined = combined.sort_index()
     combined = combined.to_frame("score")
-    combined.to_pickle(pred_path)
+
+    if in_place:
+        # Legacy behaviour: overwrite the selected run's pred.pkl.  DANGEROUS -
+        # the run's frozen positions were produced by the OLD pred, so the stored
+        # pred no longer matches its own backtest.  Kept only for compatibility.
+        combined.to_pickle(pred_path)
+        print(f"[daily_predict] (in-place) overwrote pred.pkl of run {latest.info.run_id[:12]}")
+    else:
+        # Default: write a NEW run so historical runs (and their positions) stay
+        # immutable.  run_rolling --skip-train then merges this tail via
+        # _latest_combined_pred().  This prevents the "same calendar day predicted
+        # two different ways across consecutive runs" whipsaw.
+        from qlib.workflow import R as _R
+        with _R.start(experiment_id=comb.experiment_id):
+            _R.save_objects(**{"pred.pkl": combined})
+            new_rid = _R.get_recorder().id
+        print(f"[daily_predict] saved combined pred into NEW run {new_rid[:12]}")
+
     print(f"[daily_predict] combined pred saved: {combined.index.get_level_values('datetime').min().date()} "
           f"-> {combined.index.get_level_values('datetime').max().date()} ({len(combined)} rows)")
     print("[daily_predict] done. Re-run `run_rolling.py --skip-train` to backtest.")
