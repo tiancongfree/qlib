@@ -130,16 +130,26 @@ PY
 )
 echo "  chosen rolling experiment: $NEW_EXP"
 export NEW_EXP   # needed by step [4/5] python (os.environ lookup)
-# combined pred last date
+# combined pred last date (select the run with the FURTHEST tail, not newest
+# start_time: daily_predict.py now writes the daily-appended tail into a new run,
+# and an ensemble run created later may carry a shorter tail)
 "$PY" - << 'PY'
-import pandas as pd, glob, os, mlflow
+import pandas as pd, glob, os, mlflow, pathlib
 client = mlflow.tracking.MlflowClient()
 comb = client.get_experiment_by_name("rolling_csi300_lgbm_ndrop1")
 runs = client.search_runs([comb.experiment_id], order_by=["attributes.start_time"])
-latest = runs[-1]
-f = f"mlruns/{comb.experiment_id}/{latest.info.run_id}/artifacts/pred.pkl"
-p = pd.read_pickle(f)
-print(f"  combined pred last date: {p.index.get_level_values('datetime').max().date()}")
+best = None
+for r in runs:
+    f = f"mlruns/{comb.experiment_id}/{r.info.run_id}/artifacts/pred.pkl"
+    if not os.path.exists(f):
+        continue
+    p = pd.read_pickle(f)
+    if isinstance(p, pd.DataFrame):
+        p = p.iloc[:, 0]
+    last = p.index.get_level_values("datetime").max()
+    if best is None or last > best[0]:
+        best = (last, r.info.run_id)
+print(f"  combined pred last date: {best[0].date()} (run {best[1][:12]})")
 PY
 
 # ---- 4. bundle rolling experiment + pred, scp to 244 ----
@@ -165,11 +175,22 @@ print(e.experiment_id)
 PY
 )
 RUN_ID=$("$PY" - << 'PY'
-import mlflow
+import mlflow, os, pandas as pd
 client = mlflow.tracking.MlflowClient()
 e = client.get_experiment_by_name("rolling_csi300_lgbm_ndrop1")
 runs = client.search_runs([e.experiment_id], order_by=["attributes.start_time"])
-print(runs[-1].info.run_id)
+best = None
+for r in runs:
+    f = f"mlruns/{e.experiment_id}/{r.info.run_id}/artifacts/pred.pkl"
+    if not os.path.exists(f):
+        continue
+    p = pd.read_pickle(f)
+    if isinstance(p, pd.DataFrame):
+        p = p.iloc[:, 0]
+    last = p.index.get_level_values("datetime").max()
+    if best is None or last > best[0]:
+        best = (last, r.info.run_id)
+print(best[1])
 PY
 )
 

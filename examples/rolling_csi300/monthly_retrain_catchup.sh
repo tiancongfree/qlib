@@ -1,14 +1,16 @@
 #!/bin/bash
-# Catch-up wrapper: if a scheduled monthly retrain was MISSED (e.g. machine was
-# off at 01:00 on the 1st/15th), run it now.
+# Catch-up wrapper: if a scheduled retrain was MISSED (e.g. machine was off at
+# its scheduled time), run it now.
 #
-# This is scheduled EVERY day at 09:00 (see crontab).  It checks the timestamp
+# Scheduled EVERY day (see crontab: 01:00 and 09:00).  It checks the timestamp
 # of the last successful retrain (state file logs/.last_retrain, written by
 # monthly_retrain.sh).  If the last successful retrain is >= MAX_AGE_DAYS old,
 # the previous scheduled run was missed -> trigger monthly_retrain.sh now.
 #
-# MAX_AGE_DAYS is set slightly above the interval (~15d) so a retrain that ran
-# on the 1st won't refire on the 15th morning before its own 01:00 slot.
+# 2026-09-18: retrain cadence changed from "1st/15th monthly" to EVERY 2 DAYS
+# (to reproduce/validate the daily-pred fix faster).  MAX_AGE_DAYS default is
+# therefore 2 -- the catchup IS the scheduler now; it fires as soon as the last
+# successful retrain is >= 2 days old.  Raise it back for a monthly cadence.
 #
 # Plan B (2026-09-07): a missed retrain is re-run in the DEFAULT mode of
 # monthly_retrain.sh, i.e. APPEND (only the newest window is retrained - quick).
@@ -19,7 +21,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-MAX_AGE_DAYS="${MAX_AGE_DAYS:-16}"
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-2}"
 STATE="${STATE:-$HERE/logs/.last_retrain}"
 LOCK="${LOCK:-$HERE/logs/.retrain.lock}"
 
