@@ -788,6 +788,51 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **相关半成品运维**: 09-07 07:33 自动 monthly retrain `rolling_models_20260907073326` 因内存 OOM (`BrokenProcessPool`) 只训成 3-4 个 2020 窗口即中断 (无 ens)。已把该实验目录移出 mlruns 至 `examples/rolling_csi300/mlruns_cache_aborted_20260907/` 隔离 (<b>勿把任何目录直接放 `mlruns/` 下非数值名, mlflow 会当实验目录扫)</b>. 生产仍用 `rolling_models_20260822155347` (244) / 本机最新完整 `rolling_models_20260831183707`.
 - **健康度提醒**: 09-07 起 auto-retrain cron 曾因 WSL 默认半额内存上限 + 仅 4GiB swap 而 OOM 半途 (`rolling_models_20260907073326` 只训 3-4 窗即中断)。**根修 = WSL 内存上限调高** (见"数据/环境备注": `C:\Users\田聪\.wslconfig` memory=24GB, 须 `wsl --shutdown` 重启才生效)。重启后 append(~13GB 峰值)基本不碰 swap; 若仍受旧默认限制, 训练会失败 → combined pred 停在老模型末端。**若最近一次运行失败, 先重启 WSL 再补跑 monthly_retrain.sh。**
 
+## 09-21 churn 第三处根因: append 的新模型追溯改写已服务历史 (2026-09-21 修复, 方案A 冻结, 重要)
+
+### 症状
+- 2026-09-17/18/21 连续多日 244 实盘 **大规模换仓** (09-21 单日 7 卖 / 7 买), 远超 qlib 原生 n_drop=1 (每天最多换 1 只)
+- 同一历史交易日 (如 09-16) 在**不同 combined run** 里 target 完全不同 → target 被**追溯改写**
+
+### 根因 (与前两处"pred 冻结"同源, 但这次是"已有 pred 被新模型重算")
+- 每日流程 combined pred = **完整 2020 → 今天** 的一条曲线 (回测直接读它)。它由三部分拼成:
+  1. 原始 27 段季度窗 pred (各段各自模型)
+  2. 之后每次 **append** 的新窗 pred
+  3. **daily_predict** 用**最新模型**重生成的 tail
+- **append retrain 会换"最新模型"** (每次 append 用**不同的 handler cache**: 如 09-15 append → `Alpha158Industry.161ba58d78.pkl`, 09-18 append → `Alpha158Industry.152f3e4ec2.pkl`)。换模型后 `daily_predict` 改用新模型, 而它的 tail **覆盖 09-08 起的整段** (不只今天) → **已服务过的老日期分数被新模型重写**。
+- 另有两处追溯改写点: ① `RollingEnsemble` 把 append 的新窗 (同 test 段 09-08→12-08) 与老窗 concat, `keep=latest` → 新窗盖老窗; ② `_ens_rolling` 的 `extra_pred` 段 `keep="last"` → daily tail 盖老日期。
+- 结果: pred 历史被改写 → **target 追溯变化** → 实盘账户去追新 target → 大规模 churn。
+
+### 修复 (commit `5ca83865`, 方案A "先到者赢", 改自有文件不改 qlib 源码)
+- **铁律**: 已被 live pipeline 服务过 (已下单/已回测) 的 `(datetime, instrument)` 分数**是最终值, 永不被后来的 run 改写**; 新模型只能 **ADD 新日期**, 不能 revise 已服务过的。
+- **实现**:
+  - `examples/rolling_csi300/rolling_append.py`: 新增模块函数 `freeze_served(new_pred, served_pred)` = `concat([served, new]) + keep="first"`; `AppendRolling._ens_rolling(extra_pred=None, served_pred=None)` 覆写父类, 在存 pred 前 `res["pred"] = freeze_served(merged, served_pred)`。
+  - `examples/rolling_csi300/run_rolling.py`: `--skip-train` 与 `append` 两个分支都把 `served_pred=_latest_combined_pred(exp_name)` 传入。
+  - **零改 qlib 源码** (上游 `qlib/contrib/rolling/base.py` 不动, 与 3b 的 `SortedPosition` 纯继承同一思路)。
+- **修复后口径 = 方案A / point-in-time**: 回测曲线 = 各版本模型按**首次上线时间**拼接 (谁先上线谁占坑), 与实盘真实走过的路径一致 → **无未来函数**; 想拿"最新模型全量重刷"的纯净回测时另跑 `MODE=full`。
+- **代价 (已知)**: 回测曲线不再等于"当前模型能力", 老窗的差会一直带着 — 这是诚实的 (当时就那个水平)。
+
+### 仿真 + 回归测试 (`examples/rolling_csi300/sim/`)
+- `sim/sim_merge.py`: 快速仿真 (不训练/不回测, 几秒), 复用**真实** `RollingEnsemble` + 真实 `freeze_served`, 重放 244 时间线 (append#1 模型A → 每日 daily_predict → append#2 同窗模型B), 问"老日期分数会不会变"。
+- `sim/test_sim_merge.py`: 无 pytest 依赖 (`python test_sim_merge.py` 直接跑); 断言 ① current code **会**改写老日期 (bug 文档化) ② 方案A **不改写** 且 served 历史仍跟上 today (无静默冻结)。
+- **验证结果**: 本机 + 244 均 `2/2 passed`; 当前代码 34 处追溯改写 / 全 10 天, 方案A 0 处。
+
+### 部署 (2026-09-21)
+- 本机 commit `5ca83865` (on top of `8c01b59c`) → `git bundle create … 6f9c18eff..snapshot/rolling_csi300` → scp 到 244 → `git fetch /tmp/xxx.bundle snapshot/rolling_csi300 && git merge --ff-only FETCH_HEAD`。
+- **244 HEAD**: `6f9c18eff` → **`5ca838659`** (fast-forward, 同时补上之前落后的 `8c01b59c` 每2天 cadence)。**4 个文件 sha256 与本机逐字节一致** (`rolling_append.py` `d8f5b885…`, `run_rolling.py` `0df067f9…`, `sim/sim_merge.py` `1bfdc736…`, `sim/test_sim_merge.py` `dea5af6e…`); 244 跑回归测试 `2/2 passed`。
+
+### 验证观察点 (修复生效后, 等下个交易日)
+1. sync 日志 `To sell / To buy` 应回到个位数 (正常 n_drop=1 每天最多换 1 只)
+2. 对比 244 连续两天的 `positions_*.csv`, 同一历史日期的 `weight` 应**不再变化**
+3. 若仍 churn → 还有第三条改写路径, 需再查
+
+### 244 持仓 vs 冻结后 target 的偏离 (2026-09-18 口径, 读数只读)
+- 总资产 974,592 / 股票市值 776,960 / 现金 197,632 (利用率 ~79.7%); 实际持有 **24 只**, qlib target **31 只** (wt>0.5%)
+- 交集 23 只 → **overlap/held 95.8%, overlap/target 74.2%**
+- **只持有不在 target (1)**: `SH588080` (科创50 ETF, 1000 份) — 用户决定**保留不清理** (严格 sync 会当"qlib 调出"卖出; 若要长期留需在 sync 层加白名单, 暂未动)
+- **只在 target 未持有 (8)**: 601127/688041/688506/603986/300308/002371/688521/002384 — **全是贵价/科创板**, 即 §7d-bis "整手化买不起"死角 (物理配不起, 非逻辑偏离)。AGENTS 归因: 贵价股近1年净贡献≈0 → **不建议为补齐而强买** (会把单票权重撑爆)
+- **结论**: 这 8 只不算实质偏离; 24 只已 95.8% 贴合 (且贴的是"被改写过的" target)。冻结生效后 target 不再跳变 → 持仓自然稳。
+
 ## 回撤邮件提醒 (dd_alert.py, 2026-08-13)
 
 ### 功能
