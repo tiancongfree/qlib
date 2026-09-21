@@ -833,6 +833,34 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - 本机 commit `5ca83865` (on top of `8c01b59c`) → `git bundle create … 6f9c18eff..snapshot/rolling_csi300` → scp 到 244 → `git fetch /tmp/xxx.bundle snapshot/rolling_csi300 && git merge --ff-only FETCH_HEAD`。
 - **244 HEAD**: `6f9c18eff` → **`5ca838659`** (fast-forward, 同时补上之前落后的 `8c01b59c` 每2天 cadence)。**4 个文件 sha256 与本机逐字节一致** (`rolling_append.py` `d8f5b885…`, `run_rolling.py` `0df067f9…`, `sim/sim_merge.py` `1bfdc736…`, `sim/test_sim_merge.py` `dea5af6e…`); 244 跑回归测试 `2/2 passed`。
 - **追加部署 `b495815a`** (`5ca83865..snapshot/rolling_csi300` bundle): 244 → **`b495815a9`** (fast-forward, 含 `3c27c78a` 文档)。`rolling_append.py` sha256 `00012c3b…`、`test_sim_merge.py` `136b42e4…` 两机一致; 244 回归 `3/3 passed`。
+- **追加部署健康 guard `5ed7d906`** (`cf97f25f..snapshot/rolling_csi300` bundle): 244 → **`5ed7d9062`**; `retrain_guard.py` sha256 `20ec1087…`、`dd_alert.py` `ce820659…`、`monthly_retrain.sh` `43d8e67a…` 两机逐字节一致; 244 端 guard 冒烟 `All checks passed` (exit 0)。
+
+## 重训健康 guard (retrain_guard.py, 2026-09-21, 重要)
+
+### 动机
+- `monthly_retrain.sh` 里数据更新/scp/244 部署都是 `|| echo WARN` (不中断), 且 09-20/21 出现"静默死亡"(开机同刻 OOM, 无输出) → **日志打 `Monthly retrain done` 不等于成功**, 而 `.last_retrain` 却会被推进 → catchup 以为成功、不再重试, 下游可能拿到**滞后/冻结的 pred**。
+
+### 机制
+- `retrain_guard.py` 作为 **`monthly_retrain.sh` 的最后一步**运行; **只有 guard 通过**才写 `logs/.last_retrain`; 失败 → `exit 1`, **不推进 state** → `monthly_retrain_catchup.sh` 下次定时自动重试。
+- **检查项** (全过才 healthy):
+  1. `rolling_models_*` 有 pred-bearing run (>0) — 确有窗口训成
+  2. 窗口数**未比上次 health 记录缩水** (防 full 半途中断/实验被清)
+  3. combined 实验最新 tail run 的 `pred.pkl` **和** `label.pkl` 都在
+  4. **pred tail ≥ 数据日历末 - 7 天** — 直接抓"pred 冻结" (经典 bug)
+  5. tail 当日 pred/label **index 对齐** (SigAnaRecord 契约, 防下游报告崩)
+- **产物**: `logs/.retrain_health.json` (healthy / `consecutive_failures` 连续失败计数 / 各 check 明细) + **告警邮件** (`[重训告警] 健康检查失败 (N 项)`, 含连续失败次数)。
+- **退出码**: 0=健康, 1=不健康(拦截), 2=guard 自身故障(不谎报健康)。
+- **测试**: `--no-email` 干跑; 已验证 healthy→0、exp 不存在→1、pred 冻结(伪 calendar+30d)→1、窗口缩水→1、guard crash→2; 真邮件端到端发送成功。
+
+### EMAIL_PASSWORD 解析 (顺带修 bug)
+- `dd_alert._ensure_email_password` 原实现**在训练机一直静默失败**: ① WSL 从 `\\wsl.localhost` UNC cwd 启 `cmd.exe` 时 Windows **拒绝展开环境变量** → 原样返回字面 `%EMAIL_PASSWORD%`; ② 旧代码把这个字面值**当成密码接受**。
+- **修复后解析顺序**: 进程 env → **`examples/rolling_csi300/.email_password` 文件** (单行, gitignored, **对 cron 最稳**) → `cmd.exe` interop (cwd=`/mnt/c`, 拒绝占位符)。
+- **训练机已设**: 注册表 `HKCU\Environment` 写 `EMAIL_PASSWORD` + `WSLENV=...:EMAIL_PASSWORD/u`, 并在 `examples/rolling_csi300/.email_password` 落文件 (chmod 600)。244 用 Windows env 即可 (无需文件)。
+- ⚠️ **`HKCU` 改动需新登录会话才透传到 WSL interop** (本会话 `cmd.exe` 仍读不到), 故文件路径是训练机的可靠来源。
+
+### 运维
+- 若收到 `[重训告警]`: 看 `logs/.retrain_health.json` 的 `checks` 定位; 常见 = 数据没更到 (calendar 落后, 见"数据管道") 或 OOM 半途。修好后**手动补跑** `monthly_retrain_catchup.sh` (机器稳定时, 用 `setsid` 脱离会话)。
+- 手动干跑 guard: `cd examples/rolling_csi300 && .venv/bin/python retrain_guard.py --no-email`。
 
 ### 验证观察点 (修复生效后, 等下个交易日)
 1. sync 日志 `To sell / To buy` 应回到个位数 (正常 n_drop=1 每天最多换 1 只)
