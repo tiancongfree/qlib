@@ -814,12 +814,25 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 
 ### 仿真 + 回归测试 (`examples/rolling_csi300/sim/`)
 - `sim/sim_merge.py`: 快速仿真 (不训练/不回测, 几秒), 复用**真实** `RollingEnsemble` + 真实 `freeze_served`, 重放 244 时间线 (append#1 模型A → 每日 daily_predict → append#2 同窗模型B), 问"老日期分数会不会变"。
-- `sim/test_sim_merge.py`: 无 pytest 依赖 (`python test_sim_merge.py` 直接跑); 断言 ① current code **会**改写老日期 (bug 文档化) ② 方案A **不改写** 且 served 历史仍跟上 today (无静默冻结)。
-- **验证结果**: 本机 + 244 均 `2/2 passed`; 当前代码 34 处追溯改写 / 全 10 天, 方案A 0 处。
+- `sim/test_sim_merge.py`: 无 pytest 依赖 (`python test_sim_merge.py` 直接跑); 断言 ① current code **会**改写老日期 (bug 文档化) ② 方案A **不改写** 且 served 历史仍跟上 today (无静默冻结) ③ `freeze_served` 在 served_pred=None (全新实验首次 append) 时仍返回 DataFrame。
+- **验证结果**: 本机 + 244 均 `3/3 passed`; 当前代码 34 处追溯改写 / 全 10 天, 方案A 0 处。
+
+### 追加修复: `freeze_served` 首跑返回 Series → SigAnaRecord 崩 (commit `b495815a`, 2026-09-21)
+- **症状**: 首次 append 一个**全新/空** combined 实验时, `served_pred=None`。初版 `freeze_served` 直接 `return new_pred` (Series) → 下游 `SigAnaRecord._generate` (`record_temp.py:323`) 执行 `pred.iloc[:, label_col]` → `IndexingError: Too many indexers` → 重训在 `_update_rolling_rec` 崩, 训练已完成但报告/落库失败。
+- **修复**: `freeze_served` 无论有无 served_pred 都 `.sort_index().to_frame("score")` 返回值 (下游需要 DataFrame)。加回归测试 `test_fresh_exp_first_run_returns_dataframe`。
+- **注意**: 生产 exp (`rolling_csi300_lgbm_ndrop1`) 有 served_pred, 故生产不触发此 bug; 只有首次建实验/清空后触发。
+
+### 09-20/09-21 cron 重训"静默死亡"排查结论 (非本 bug, 环境因素)
+- **现象**: catchup 于 09-20 18:23 / 09-21 18:22 触发 append, 日志停在 `[2/5] APPEND: retraining...` 后**零输出**直接 `catch-up retrain FAILED`。
+- **排查**: `who -b` 显示 WSL **2026-09-21 18:22 刚重启**, cron 恰在开机同刻由 `~/.profile` 登录 catchup 拉起 → **开机内存/IO 高压下 run_rolling 被 OOM-kill** (无 OOM 日志, 缓冲丢失)。非代码 bug。
+- **复现验证**: 机器稳定后手动跑完整 `monthly_retrain_catchup.sh` (setsid 脱离会话) → **全链路成功**: `[1/5]` 数据(900s 超时 WARN) → `[2/5]` append 训练 → `[3/5]` locate → `[4/5]` bundle → `[5/5]` 部署 244 → `Monthly retrain done`; `.last_retrain=20260921 19:23`。
+- **freeze 生效实测**: 新 combined run (`d0feed7021ec`) vs 原 served run (`b254df1a408a`) → **common 487758 行, maxdiff=0.0, changed=0, tail 均 09-18** → 已服务历史零改写 (方案A 生效)。
+- **教训**: catchup 在**开机同刻**触发易被 OOM 杀; 若再次"静默死亡", 先 `uptime` 看是否刚重启, 稳定后手动补跑即可 (不必改码)。
 
 ### 部署 (2026-09-21)
 - 本机 commit `5ca83865` (on top of `8c01b59c`) → `git bundle create … 6f9c18eff..snapshot/rolling_csi300` → scp 到 244 → `git fetch /tmp/xxx.bundle snapshot/rolling_csi300 && git merge --ff-only FETCH_HEAD`。
 - **244 HEAD**: `6f9c18eff` → **`5ca838659`** (fast-forward, 同时补上之前落后的 `8c01b59c` 每2天 cadence)。**4 个文件 sha256 与本机逐字节一致** (`rolling_append.py` `d8f5b885…`, `run_rolling.py` `0df067f9…`, `sim/sim_merge.py` `1bfdc736…`, `sim/test_sim_merge.py` `dea5af6e…`); 244 跑回归测试 `2/2 passed`。
+- **追加部署 `b495815a`** (`5ca83865..snapshot/rolling_csi300` bundle): 244 → **`b495815a9`** (fast-forward, 含 `3c27c78a` 文档)。`rolling_append.py` sha256 `00012c3b…`、`test_sim_merge.py` `136b42e4…` 两机一致; 244 回归 `3/3 passed`。
 
 ### 验证观察点 (修复生效后, 等下个交易日)
 1. sync 日志 `To sell / To buy` 应回到个位数 (正常 n_drop=1 每天最多换 1 只)
