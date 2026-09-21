@@ -26,8 +26,40 @@ it needs NO edit to qlib source (unlike e.g. the position.py sort patch).  For a
 
 from typing import List
 
+import pandas as pd
+
 from qlib.contrib.rolling.base import Rolling
+from qlib.model.ens.ensemble import RollingEnsemble
 from qlib.model.trainer import TrainerR
+from qlib.workflow import R
+from qlib.workflow.task.collect import RecorderCollector
+
+
+def _series(x):
+    return x.iloc[:, 0] if hasattr(x, "columns") else x
+
+
+def freeze_served(new_pred, served_pred):
+    """Option A: an already-served (datetime, instrument) score is FINAL.
+
+    The combined pred that the live pipeline already served (backtest target /
+    sync orders) is the source of truth for every index it contains.  A later
+    append retrain may only ADD rows (new dates / new instruments); it may never
+    overwrite one that was already served.  Without this, a retrain that produces
+    a new "newest model" (different handler cache) rewrites past scores -> the live
+    account chases a retroactively-changed target (the Sep-2026 7-buy/7-sell churn).
+
+    Implemented as concat([served, new]) + keep="first": served wins on overlap,
+    genuinely-new rows survive.
+    """
+    if served_pred is None:
+        return new_pred
+    served = _series(served_pred).rename("score")
+    new = _series(new_pred).rename("score")
+    merged = pd.concat([served, new])
+    merged = merged[~merged.index.duplicated(keep="first")]
+    merged = merged.sort_index().to_frame("score")
+    return merged
 
 
 class AppendRolling(Rolling):
@@ -53,5 +85,36 @@ class AppendRolling(Rolling):
         )
         trainer([task_l[-1]])
 
-    # Everything else (basic_task / get_task_list / _ens_rolling / _update_rolling_rec /
-    # run) is inherited unchanged from the parent Rolling.
+    def _ens_rolling(self, extra_pred=None, served_pred=None):
+        """Same as the parent, but the previously-served combined pred is frozen.
+
+        Two retroactive-rewrite points are neutralised by ``freeze_served``:
+          1. ``RollingEnsemble`` re-concats every rolling window; a newly appended
+             window (new model) would overwrite an old window's scores for the same
+             dates.
+          2. ``extra_pred`` (the daily-appended tail) is itself repredicted by the
+             newest model and overlaps already-served past dates.
+        Passing ``served_pred`` (the combined pred already consumed by the live
+        pipeline) freezes both: only genuinely new dates survive from the fresh run.
+        """
+        rc = RecorderCollector(
+            experiment=self.rolling_exp,
+            artifacts_key=["pred", "label"],
+            process_list=[RollingEnsemble()],
+            artifacts_path={"pred": "pred.pkl", "label": "label.pkl"},
+        )
+        res = rc()
+        merged = _series(res["pred"]).rename("score")
+        if extra_pred is not None:
+            # Extend with the daily-appended tail (keeps the pred advancing past
+            # the last rolling test window).
+            extra = _series(extra_pred).rename("score")
+            merged = pd.concat([merged, extra])
+            merged = merged[~merged.index.duplicated(keep="last")]
+            merged = merged.sort_index()
+        # FREEZE: never let a later run revise an already-served score.
+        res["pred"] = freeze_served(merged, served_pred)
+        with R.start(experiment_name=self.exp_name):
+            R.log_params(exp_name=self.rolling_exp)
+            R.save_objects(**{"pred.pkl": res["pred"], "label.pkl": res["label"]})
+            self._rid = R.get_recorder().id

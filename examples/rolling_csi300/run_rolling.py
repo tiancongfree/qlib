@@ -268,8 +268,14 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
         # freezes and live rebalancing stops.  Instead we merge the rolling ensemble
         # with any existing (already-extended) combined pred (extra_pred) so the
         # combined pred keeps advancing.
+        #
+        # served_pred FREEZES every date that combined pred already covered: a later
+        # retrain (new "newest model" / different handler cache) must not rewrite an
+        # already-served score, otherwise the live target is retroactively changed and
+        # the account chases it (the Sep-2026 7-buy/7-sell churn).  See
+        # AppendRolling._ens_rolling / freeze_served.
         tail_pred = _latest_combined_pred(exp_name)
-        rolling._ens_rolling(extra_pred=tail_pred)
+        rolling._ens_rolling(extra_pred=tail_pred, served_pred=tail_pred)
         rolling._update_rolling_rec()
     else:
         if mode == "append":
@@ -289,8 +295,15 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
             # Re-ensemble with any existing (already daily-extended) combined pred so
             # the daily/appended tail is preserved (frozen-pred fix).  train_append()
             # only trains; it does NOT ensemble, so do it here.
+            #
+            # served_pred FREEZES every date already served: the freshly appended
+            # window's pred (a new "newest model", possibly a different handler cache)
+            # must not overwrite scores for dates the live pipeline already used,
+            # otherwise the retroactive target change makes the account churn (the
+            # Sep-2026 7-buy/7-sell incident).  See AppendRolling._ens_rolling /
+            # freeze_served.
             tail_pred = _latest_combined_pred(exp_name)
-            rolling._ens_rolling(extra_pred=tail_pred)
+            rolling._ens_rolling(extra_pred=tail_pred, served_pred=tail_pred)
             rolling._update_rolling_rec()
         else:  # full -> old behaviour: train every window + ensemble + report.
             task_list = rolling.get_task_list()
