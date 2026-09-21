@@ -48,8 +48,33 @@ def test_option_a_freezes_past():
     assert lag == [], f"Option A froze the tail (silent freeze) at: {lag}"
 
 
+def test_fresh_exp_first_run_returns_dataframe():
+    # REGRESSION: when there is no previously-served combined pred (a fresh
+    # experiment, or the very first append), freeze_served must still return the
+    # DataFrame shape downstream expects. SigAnaRecord does `pred.iloc[:, 0]` /
+    # `label.iloc[:, label_col]`, which raises "IndexingError: Too many indexers"
+    # on a Series (this bit the first append of a brand-new experiment).
+    import pandas as pd
+    from rolling_append import freeze_served
+
+    idx = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2026-09-18"), "SH600000")], names=["datetime", "instrument"]
+    )
+    series = pd.Series([1.5], index=idx, name="score")
+    out = freeze_served(series, None)
+    assert isinstance(out, pd.DataFrame), f"expected DataFrame, got {type(out).__name__}"
+    assert list(out.columns) == ["score"]
+    # and with a served pred present it must also be a DataFrame
+    out2 = freeze_served(series, series)
+    assert isinstance(out2, pd.DataFrame)
+
+
 def _run_standalone():
-    tests = [test_current_code_rewrites_past, test_option_a_freezes_past]
+    tests = [
+        test_current_code_rewrites_past,
+        test_option_a_freezes_past,
+        test_fresh_exp_first_run_returns_dataframe,
+    ]
     failed = 0
     for t in tests:
         name = t.__name__

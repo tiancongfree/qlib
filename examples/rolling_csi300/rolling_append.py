@@ -52,10 +52,13 @@ def freeze_served(new_pred, served_pred):
     Implemented as concat([served, new]) + keep="first": served wins on overlap,
     genuinely-new rows survive.
     """
-    if served_pred is None:
-        return new_pred
-    served = _series(served_pred).rename("score")
     new = _series(new_pred).rename("score")
+    if served_pred is None:
+        # Nothing served yet (first run / fresh experiment): nothing to freeze,
+        # but still hand downstream the DataFrame shape it expects
+        # (SigAnaRecord does pred.iloc[:, label_col]).
+        return new.sort_index().to_frame("score")
+    served = _series(served_pred).rename("score")
     merged = pd.concat([served, new])
     merged = merged[~merged.index.duplicated(keep="first")]
     merged = merged.sort_index().to_frame("score")
