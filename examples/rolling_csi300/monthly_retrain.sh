@@ -238,12 +238,29 @@ timeout 120 ssh -i "$SSH_KEY" "$REMOTE" "wsl -u tc bash /mnt/c/Users/tc/Desktop/
 
 echo ""
 echo "=============================================="
-echo "Monthly retrain done: $(date)"
+echo "Monthly rolling retrain finished: $(date)"
 echo "Log: $LOG"
 echo "=============================================="
 
-# Record last successful retrain time (for monthly_retrain_catchup.sh)
-STATE="${STATE:-$LOG_DIR/.last_retrain}"
-printf '%s %s\n' "$(date '+%Y%m%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M')" > "$STATE"
-echo "Wrote last-retrain state: $STATE"
-echo "$(cat "$STATE")"
+# ---- health guard: only mark success if artifacts are actually fresh/usable ----
+# "exited 0" is NOT proof of success: earlier steps tolerate failures with
+# `|| echo WARN` (data update, scp, 244 deploy) and a silent OOM death writes
+# nothing at all.  Checks that the newest window trained, the combined pred+label
+# exist, pred tail reaches the calendar, and indices align; on failure it writes
+# logs/.retrain_health.json and emails an alert, and we DO NOT advance the state
+# so monthly_retrain_catchup.sh retries on its next scheduled run.
+echo ""
+echo "[guard] Verifying retrain artifacts..."
+if "$PY" retrain_guard.py --exp "$EXP"; then
+    STATE="${STATE:-$LOG_DIR/.last_retrain}"
+    printf '%s %s\n' "$(date '+%Y%m%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M')" > "$STATE"
+    echo "Wrote last-retrain state: $STATE"
+    echo "$(cat "$STATE")"
+    echo ""
+    echo "=============================================="
+    echo "Monthly retrain done (guard passed): $(date)"
+    echo "=============================================="
+else
+    echo "HEALTH GUARD FAILED -> NOT writing $LOG_DIR/.last_retrain (catch-up will retry)"
+    exit 1
+fi

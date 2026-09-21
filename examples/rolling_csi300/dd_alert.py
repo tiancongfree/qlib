@@ -35,24 +35,41 @@ DEFAULT_STATE_FILE = SCRIPT_DIR / "dd_alert_state.json"
 def _ensure_email_password():
     """Make sure EMAIL_PASSWORD is available to send_email.
 
-    On 244 the password lives as a Windows user environment variable, which
-    does not always propagate into a WSL bash session (WSLENV bridging is
-    unreliable).  Fall back to reading it via cmd.exe interop (WSL accesses
-    Windows user env the same way the daily bat does).
+    Resolution order (first hit wins):
+      1. EMAIL_PASSWORD already in the process env (e.g. exported by cron).
+      2. WSL-side file  examples/rolling_csi300/.email_password  (one line,
+         gitignored).  This is the ROBUST path: it needs no Windows interop and
+         works identically from an interactive shell and from cron.
+      3. cmd.exe interop reading the Windows *user* env var -- kept for 244 where
+         EMAIL_PASSWORD lives in HKCU\\Environment with WSLENV bridging.  Note
+         cmd.exe spawned from a \\wsl.localhost UNC cwd would return the literal
+         "%EMAIL_PASSWORD%"; we run it from C:\\ and reject a placeholder result.
     """
     if os.environ.get("EMAIL_PASSWORD"):
         return True
+    # 2. WSL-side file (preferred on the research machine / cron)
+    pw_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".email_password")
     try:
-        raw = subprocess.run(
-            ["cmd.exe", "/c", "echo %EMAIL_PASSWORD%"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
+        if os.path.exists(pw_file):
+            val = open(pw_file, encoding="utf-8").read().strip()
+            if val:
+                os.environ["EMAIL_PASSWORD"] = val
+                return True
+    except Exception:
+        pass
+    # 3. Windows user env via interop (best effort)
+    try:
+        proc = subprocess.run(
+            ["cmd.exe", "/c", "echo", "%EMAIL_PASSWORD%"],
+            capture_output=True, timeout=10, cwd="/mnt/c",
+        )
+        raw = proc.stdout.decode("utf-8", errors="replace").strip().strip("\r")
     except Exception:
         raw = ""
-    if raw:
-        os.environ["EMAIL_PASSWORD"] = raw
+    if raw and "%EMAIL_PASSWORD%" not in raw:
+        os.environ["EMAIL_PASSWORD"] = raw.rsplit("\n", 1)[-1].strip().strip("\r")
         return True
-    print("WARNING: EMAIL_PASSWORD not found in WSL env or Windows user env.")
+    print("WARNING: EMAIL_PASSWORD not found (env / .email_password / Windows user env).")
     return False
 
 

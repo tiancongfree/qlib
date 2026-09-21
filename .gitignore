@@ -15,6 +15,7 @@ dist/
 *.csv
 
 .env
+.email_password
 .vim
 .nvimrc
 .vscode
