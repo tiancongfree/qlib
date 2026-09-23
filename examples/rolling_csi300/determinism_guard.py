@@ -150,12 +150,16 @@ def record_and_check_positions(exp_name: str, raise_on_rewrite: bool = False) ->
             prev = {}
     prev_runs = prev.get("runs", {})
 
+    # Only compare this experiment against its OWN previous record.  Different
+    # experiments (probe runs, other configs) legitimately have different
+    # targets and must not trigger a false "rewrite" alarm.
     rewritten = []
-    for exp_key, rec in prev_runs.items():
+    rec = prev_runs.get(exp_name)
+    if rec:
         common = set(rec.get("targets", {})) & set(run_record)
         for d in sorted(common):
             if rec["targets"][d] != run_record[d]:
-                rewritten.append((exp_key, d, rec["targets"][d], run_record[d]))
+                rewritten.append((exp_name, d, rec["targets"][d], run_record[d]))
 
     status = "OK"
     if rewritten:

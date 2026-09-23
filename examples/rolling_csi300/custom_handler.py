@@ -28,6 +28,171 @@ class SortedPosition(Position):
         return sorted(super().get_stock_list())
 
 
+def _deterministic_score_index(score: pd.Series) -> pd.Index:
+    """Return instrument names sorted by score desc, ties broken by NAME.
+
+    qlib's TopkDropoutStrategy uses ``sort_values(ascending=False)`` (unstable
+    quicksort).  When scores **tie** -- most commonly the held stocks that have
+    no signal on a given day and are reindexed to NaN -- the winner among the tie
+    is whatever the unstable sort happens to emit, which in turn depends on the
+    incoming index/dict/union order.  That made the n_drop=1 sell pick vary across
+    identical runs (AGENTS.md "第四处根因", e.g. 2022-07-05 selling SH603338 vs
+    SZ002157).  Sorting by ``(-score, name)`` with NaN treated as the lowest score
+    makes the decision a pure function of the (date, scores) input.
+    """
+    df = pd.DataFrame({"score": score})
+    df["name"] = df.index.astype(str)
+    # NaN scores -> -inf so they sort to the bottom deterministically, then name asc
+    df["key"] = df["score"].fillna(-np.inf)
+    df = df.sort_values(by=["key", "name"], ascending=[False, True], kind="mergesort")
+    return pd.Index(df["name"])
+
+
+class DeterministicTopkDropoutStrategy(TopkDropoutStrategy):
+    """TopkDropoutStrategy whose leaderboard ties are broken deterministically.
+
+    Reimplements ``generate_trade_decision`` identically to qlib's, except every
+    ``sort_values(ascending=False)`` is replaced by ``_deterministic_score_index``
+    (descending score, then instrument name).  This removes the last run-to-run
+    non-determinism in the n_drop=1 backtest without patching qlib source.
+    """
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        if self.only_tradable:
+            def get_first_n(li, n, reverse=False):
+                cur_n = 0
+                res = []
+                for si in reversed(li) if reverse else li:
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    ):
+                        res.append(si)
+                        cur_n += 1
+                        if cur_n >= n:
+                            break
+                return res[::-1] if reverse else res
+
+            def get_last_n(li, n):
+                return get_first_n(li, n, reverse=True)
+
+            def filter_stock(li):
+                return [
+                    si
+                    for si in li
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                ]
+
+        else:
+            def get_first_n(li, n):
+                return list(li)[:n]
+
+            def get_last_n(li, n):
+                return list(li)[-n:]
+
+            def filter_stock(li):
+                return li
+
+        current_temp = copy.deepcopy(self.trade_position)
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+        current_stock_list = current_temp.get_stock_list()
+        # last position (sorted by score, ties by name)
+        last = _deterministic_score_index(pred_score.reindex(current_stock_list))
+        if self.method_buy == "top":
+            today = get_first_n(
+                _deterministic_score_index(pred_score[~pred_score.index.isin(last)]),
+                self.n_drop + self.topk - len(last),
+            )
+        elif self.method_buy == "random":
+            topk_candi = get_first_n(
+                _deterministic_score_index(pred_score), self.topk
+            )
+            candi = list(filter(lambda x: x not in last, topk_candi))
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+        comb = _deterministic_score_index(pred_score.reindex(last.union(pd.Index(today))))
+
+        if self.method_sell == "bottom":
+            sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        elif self.method_sell == "random":
+            candi = filter_stock(last)
+            try:
+                sell = pd.Index(np.random.choice(candi, self.n_drop, replace=False) if len(last) else [])
+            except ValueError:
+                sell = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        buy = today[: len(sell) + self.topk - len(last)]
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
+            ):
+                continue
+            if code in sell:
+                time_per_step = self.trade_calendar.get_freq()
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
+                sell_amount = current_temp.get_stock_amount(code=code)
+                sell_order = Order(
+                    stock_id=code,
+                    amount=sell_amount,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=Order.SELL,
+                )
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(
+                        sell_order, position=current_temp
+                    )
+                    cash += trade_val - trade_cost
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        for code in buy:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
+            ):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+
 class VolatilityTimingStrategy(TopkDropoutStrategy):
     """Dynamic topk based on CSI 300 volatility + trend regime.
 
@@ -122,7 +287,7 @@ class VolatilityTimingStrategy(TopkDropoutStrategy):
         return super().generate_trade_decision(execute_result)
 
 
-class ICTimingStrategy(TopkDropoutStrategy):
+class ICTimingStrategy(DeterministicTopkDropoutStrategy):
     """TopkDropoutStrategy with dynamic position sizing based on trailing RankIC.
 
     Uses the realized RankIC over the trailing ``ic_window`` trading days to
@@ -218,6 +383,174 @@ class ICTimingStrategy(TopkDropoutStrategy):
             self.risk_degree = 0.95
         # else: keep previous risk_degree (hysteresis)
         return super().generate_trade_decision(execute_result)
+
+
+class ExpensiveFilterICTimingStrategy(ICTimingStrategy):
+    """ICTimingStrategy that excludes "expensive" stocks from NEW buys.
+
+    修正小资金实盘 vs 理论回测的系统偏差: 回测(TopkDropout)对每只买入分配
+    `cash*risk_degree/len(buy)` 的等权金额且可按非整手成交, 而实盘 `_to_lots`
+    必须按整手 (主板 100 / 科创 200) 买. 当一只股票的**一整手市值**相对该股
+    **等权目标金额** (账户资金/topk) 偏离过大时, 小资金账户实际配不起一手,
+    回测却仍能买其"半股" → 模拟盘跑输理论.
+
+    本策略在**新买入候选**中剔除这类"贵价股" (判定基准固定 = 账户资金/topk),
+    让回测在源头就不含配不起的股票, 使回测口径 ≈ 真实小资金可得.
+    **不卖出已持有的贵价股** (只拒新买); 被剔除的贵价股名额**顺延**给下一名
+    高分非贵价股.
+
+    Parameters
+    ----------
+    expense_deviation : float
+        贵价判定阈值: 一手市值 / 等权目标金额 >= 1 + expense_deviation 即判贵价.
+        默认 0.05 (偏离>=5%).
+    account : float
+        判定用的账户资金 (etc RMB). 等权目标金额 = account / topk.
+    trade_unit : int
+        整手股数 (主板 100; 科创实为 200 但回测统一用 100, 此处默认 100).
+    """
+
+    def __init__(
+        self,
+        *,
+        expense_deviation=0.05,
+        account=None,
+        trade_unit=100,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.expense_deviation = expense_deviation
+        self.trade_unit = trade_unit
+        self.account = account
+        self._expensive = None  # cache: instrument -> bool
+
+    def _is_expensive(self, code, trade_start_time, trade_end_time):
+        """A stock is "expensive" if one lot of it costs >= (1+exp_dev)*target_weight_amount.
+
+        Uses the backtest's own deal price (close) so no external market query is
+        needed and the measure is time-consistent with the backtest itself.
+        """
+        if self.account is None or self.topk <= 0:
+            return False
+        try:
+            price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+        except Exception:
+            return False
+        if price is None or price != price or price <= 0:
+            return False
+        one_lot_value = price * self.trade_unit
+        target_amount = self.account / self.topk
+        return one_lot_value >= target_amount * (1 + self.expense_deviation)
+
+    def generate_trade_decision(self, execute_result=None):
+        # reuse ICTiming IC-driven risk_degree
+        if self._ic_series is None:
+            self._precompute_ic()
+
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        cur_ts = pd.Timestamp(trade_end_time)
+
+        trailing_ic = self._current_ic(cur_ts)
+        if trailing_ic < self.ic_low:
+            self.risk_degree = self.low_risk
+        elif trailing_ic > self.ic_high:
+            self.risk_degree = 0.95
+
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        current_temp = copy.deepcopy(self.trade_position)
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+        current_stock_list = current_temp.get_stock_list()
+        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+
+        # CANDIDATE POOL: exclude *not-yet-held* expensive stocks from new buys.
+        # Held expensive stocks stay (only-new-buy exclusion).
+        cand_ok = pred_score[~pred_score.index.isin(last)]
+        cand_ok = cand_ok[
+            ~cand_ok.index.map(lambda c: self._is_expensive(c, trade_start_time, trade_end_time))
+        ]
+
+        if self.method_buy == "top":
+            today = list(cand_ok.sort_values(ascending=False).index)[: self.n_drop + self.topk - len(last)]
+        elif self.method_buy == "random":
+            topk_candi = list(cand_ok.sort_values(ascending=False).index)[: self.topk]
+            candi = [x for x in topk_candi if x not in last]
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        if self.method_sell == "bottom":
+            sell = last[last.isin(pd.Index(list(comb)[-self.n_drop:]))]
+        else:
+            raise NotImplementedError("random sell not supported in ExpensiveFilterICTimingStrategy")
+
+        buy = today[: len(sell) + self.topk - len(last)]
+
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
+            ):
+                continue
+            if code in sell:
+                time_per_step = self.trade_calendar.get_freq()
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
+                sell_order = Order(
+                    stock_id=code,
+                    amount=current_temp.get_stock_amount(code=code),
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=Order.SELL,
+                )
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, _ = self.trade_exchange.deal_order(sell_order, position=current_temp)
+                    cash += trade_val - trade_cost
+
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        for code in buy:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
+            ):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price
+            factor = self.trade_exchange.get_factor(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+            )
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 
 GLOBAL_TECH_INDUSTRIES = {"C39", "I63", "I64", "I65", "R86", "R87"}
