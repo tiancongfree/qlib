@@ -899,6 +899,49 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **部署**: `13b1c039e..snapshot/rolling_csi300` bundle → 244 fast-forward 到 `bac56e9e`; `custom_handler.py` sha256 `975ae150…` / `determinism_guard.py` `592fd8a4…` 两机逐字节一致。
 - **注**: 修复改变了历史 target 定序 (从"偶发不确定"变为"按名确定"), 故生产 combined/positions 将出现一次性的**定序对齐** (非新 bug); 之后逐日应恢复 n_drop=1 个位数换手。
 
+## churn 第五/六处根因→已修复: LightGBM 线程非确定 + 研究变体残留不稳定排序 (2026-09-23, commit `a0b02b16`)
+
+> 第四处根因修完后再全库扫非确定源, 又抓到两个 (一个**真实高频**、一个**潜伏**)。
+
+### 根因5 (重要, 实测真实非确定): LightGBM `num_threads:20` 直方图构建顺序不稳
+- **症状**: `rolling_config.yaml` 只传 `num_threads:20`, **无** `deterministic`/`force_row_wise`/显式 seed。LightGBM 多线程直方图构建的浮点求和顺序 run-to-run 漂移。
+- **决定性实测** (LGB 4.6, `200000 x 177 float32`, prod 超参): **3 次跑出 2 个不同 hash** (`1c2a79b79eeb5274` / `e0079b1ac71d4cdb` / `1c2a79b79eeb5274`) → **训练本身非确定**。
+  - ⚠️ 小数据 (2万×50) 测不出 (多次一致) → **必须用接近生产的规模测**, 否则误判"没问题"。
+  - 加 pin 后 (**`deterministic:true, force_row_wise:true, seed/bagging_seed/feature_fraction_seed/data_random_seed:0`**) → **3 次全 `a92e09ccf8317310` 逐字节一致**。
+- **修复**: `rolling_config.yaml` 的 `task.model.kwargs` 加上述 6 个 key (config-only, **零改 qlib 源码**; `LGBModel` 把 kwargs 原样传给 `lgb.train`)。
+- **⚠️ 副作用 (预期)**: pin **改变训练出的模型** (pin hash ≠ 任一 unpinned hash) → **下次重训产出的 pred/target 与 09-23 前不同**, 这是修复的应有代价 (之前根本不可复现)。**不追溯改写已服务历史** (方案A freeze 仍在)。
+- 验证: `LGBModel(**kwargs).params` 确认 6 key 到位 (`deterministic=True/force_row_wise=True/seed=0…`)。
+
+### 根因6 (潜伏, 非生产路径): 研究变体残留 qlib 原版不稳定 `sort_values`
+- 第四处只改了**生产**的 `ICTimingStrategy`。全库扫出另有 4 个 **TopkDropout 变体**仍用 qlib 原版 `sort_values(ascending=False)` (同样的 NaN tie-break 隐患):
+  - `ExpensiveFilterICTimingStrategy` (自实现决策, L474/484/486/496)
+  - `IndustryCappedStrategy` (L1028-1033)
+  - `MinTradeValueStrategy` (L1166-1184)
+  - `VolatilityTimingStrategy` (继承 `TopkDropoutStrategy`, 走 qlib 原版)
+- **修复**: 前 3 个自实现的 `sort_values` 全换 `_deterministic_score_index()`; `VolatilityTimingStrategy`/`IndustryCappedStrategy`/`MinTradeValueStrategy` 改继承 `DeterministicTopkDropoutStrategy`。**全文件已无决策路径用不稳定排序** (仅 docstring 提及)。
+- **状态**: 均为**研究变体, 不在生产 config** (生产仍 `ICTimingStrategy`), 修复只是根除潜伏同类 bug; 不影响生产回测数字。
+
+### 其他扫描结论 (未改, 记录备查)
+- **休眠 (生产不用)**: `MultiPassPortAnaRecord.random_init` 用未播种 `np.random.shuffle` (`record_temp.py:629`) — 生产只用 Signal/SigAna/PortAnaRecord, 休眠。
+- **低概率**: `_find_latest_rolling_exp`/`daily_predict` 选"最新实验"仅按 `creation_time` (毫秒并列时靠枚举顺序), `_latest_combined_pred` 同 tail 日期时保"先遇到"。可加 `(creation_time, name)` 二级 key, 暂未动。
+- **已确认安全**: `exchange.py:637` `sorted(set(...))`+`random.seed(0)`+shuffle、`executor.py:585` `sorted(orders)`、`data.py:582`、`handler.py` `lazy_sort_index`、`IndustryProcessor`、`ICTimingStrategy._precompute_ic`、`RollingEnsemble` (已 freeze)。
+
+### 验证 (跨机跨 seed 四跑 byte-identical)
+| run | 机器 | PYTHONHASHSEED | path_hash |
+|---|---|---|---|
+| verified_detA | 本机 | 0 | `317e3fca6e8f99fa` |
+| verified_detB | 本机 | 999 | `317e3fca6e8f99fa` |
+| verified_244_detA | 244 | 0 | `317e3fca6e8f99fa` |
+| verified_244_detB | 244 | 999 | `317e3fca6e8f99fa` |
+
+- 与第四处修复 hash **相同** (`317e3fca…`) → 本两处修复**不改变回测行为** (只消除潜在非确定)。
+- 配置/文件两机逐字节一致: `custom_handler.py` sha256 `ba500444…`, `rolling_config.yaml` sha256 `4a728f7e…`。
+- 验证后已清理两机 `.determinism_state.json` 的 `verified_*`/`det_fix*` 键 (避免污染首次生产 run 的比对)。
+
+### 部署 (2026-09-23)
+- 本机 commit `a0b02b16` (on top of `20d66324`) → bundle `20d66324..snapshot/rolling_csi300` → scp 244 → **244 fast-forward `20d663247` → `a0b02b163`**。
+- **部署插曲**: 244 的 `rolling_config.yaml` 因每日流程本地已改 `end_time: 09-11→09-23` (staged), fast-forward 被拒 → `git restore --staged --worktree` 清脏后 merge (我们 commit 的 `end_time` 也是 09-23, 无值冲突)。
+
 ### 取证 (早前, 数据只到 09-22 时的初判 — 已被上节取代/修正)
 - **三连 run 的 pred 逐字节相同**: 09-21 `182d078d` / 09-22 `8f1f026f` / 09-23 `1a7a78d0` 的 `pred.pkl` 全历史 (488058 行) **maxdiff=0**; 与本机干净 e21 (钉 09-21, 32-run 实验 `20260907080005`) 也一致 (1.4e-17 浮点噪声)。
 - **但持仓路径大幅互异**: 同日期 target 名单三三互改 **339 / 274 / 386 天** (例: 2022-11-30 `8f1f026f` n=30 含 `SZ300751`, `1a7a78d0` n=29 不含)。**pred 相同 → 目标不同 = 纯回测执行层非确定。**
