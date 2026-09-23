@@ -874,16 +874,38 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 2. 对比 244 连续两天的 `positions_*.csv`, 同一历史日期的 `weight` 应**不再变化**
 3. 若仍 churn → 还有第三条改写路径, 需再查
 
-## 09-22/09-23 churn 第四处根因: 回测执行层非确定 (244), 哨兵已加 (2026-09-23)
+## 09-23 churn 第四处根因→已修复: TopkDropout 排序 tie-break 非确定 (2026-09-23)
 
-### 取证 (本机同步 244 数据到 09-22 后决定性复现)
+### 定论 (2026-09-23 晚, 数据到 09-23 后决定性复现)
+- **不是"只偶发于 244"**: 于 **244 同一 exp `rolling_csi300_lgbm_ndrop1`** 内, 同 pred 的相邻 run **互相改写** — 新 run(09-23) vs `0b94a76a`(09-22) 改 **89 天**, 而 vs `8cb78ee2`/`fb83f4f4`(09-22) 却 **diff=0**。即同机同数据同 pred 下, 多数 run 一致、偶发一两个 run 偏离 → **回测执行层确有非确定** (与早前 `8f1f026f` 偶发同类)。
+- **首个分叉点精确定位**: `0b94a76a` vs `8cb78ee2` 首个 (且唯一前置无 amount 差) 分叉在 **2022-07-05**, 两者 07-04 均持 31 只 (cash 43994.24 全同), 07-05 都降到 30 只 (n_drop=1, **纯卖不买**), 但 **A 卖 `SH603338` / B 卖 `SZ002157`**。
+- **根因 = qlib TopkDropout 的 NaN tie-break 不稳**: 该日被 `last = pred.reindex(current_stock_list).sort_values(ascending=False)` 排到最后的是 **4 只 NaN 分数** (`SH603338/SZ002024/SZ002044/SZ002157`, 当日无 signal 的持仓股)。`sort_values` 默认 **quicksort (不稳定)**, NaN 并列时保留**输入 index 顺序**, 再经 `last.union(today)` / reindex 顺序扰动 → `comb[-1]` (=n_drop=1 的卖出票) 在这些 NaN 间**不确定**。**`SortedPosition` 修不掉它** — 那是 `get_stock_list` 的 set-order, 这是 `sort_values` 内部 tie 顺序, 两码事。
+- 决定性验证: 同一 NaNs 集合仅**换输入 index 顺序**, `sort_values` 末尾 NaN 就变 (SH603338↔SZ002157), 而 score 值逐字节相同 → 与 pred 无关, 纯排序 tie 非确定。
+
+### 修复 (commit `bac56e9e`, 改自有文件零改 qlib 源码)
+- `custom_handler.py` 新增 **`DeterministicTopkDropoutStrategy(TopkDropoutStrategy)`**: **完整复刻** qlib `generate_trade_decision`, 把 4 处 `sort_values(ascending=False)` 全换成 `_deterministic_score_index()` = 按 **`(-score, name)` 排序** (`mergesort` 稳定, NaN 视作 -inf 排最后, 名字升序 tie-break) → 决策成为 (date, scores) 的**纯函数**, 与 dict/set/union 顺序无关。
+- **`ICTimingStrategy` 改继承 `DeterministicTopkDropoutStrategy`** (原继承 `TopkDropoutStrategy`)。
+- **`determinism_guard.py` 修 bug**: `record_and_check_positions` 原来把新 run 与**状态文件里所有 exp**逐一比 (`for exp_key, rec in prev_runs.items()`) → 探针/异 config 实验互相误报 (曾对 244 报假 "552 天改写/ vs det_244_1")。**改为只与本 exp 自己的上一条记录比** (`prev_runs.get(exp_name)`)。
+- **验证 (跨机跨 seed 四跑 byte-identical)**:
+
+  | run | 机器 | PYTHONHASHSEED | path_hash |
+  |---|---|---|---|
+  | fixA | 本机 | 0 | `317e3fca6e8f99fa` |
+  | fixB | 本机 | 12345 | `317e3fca6e8f99fa` |
+  | fix244_a | 244 | default | `317e3fca6e8f99fa` |
+  | fix244_b | 244 | default | `317e3fca6e8f99fa` |
+
+  修复后 2022-07-05 选 **卖 `SZ002157`, 保留 `SH603338`** (= 原多数 run `8cb78ee2` 口径)。修前本机 path_hash 为 `eaf32b4809e961a5`, 修后 `317e3fca…` (行为变了, 因 tie 按名定序)。
+- **部署**: `13b1c039e..snapshot/rolling_csi300` bundle → 244 fast-forward 到 `bac56e9e`; `custom_handler.py` sha256 `975ae150…` / `determinism_guard.py` `592fd8a4…` 两机逐字节一致。
+- **注**: 修复改变了历史 target 定序 (从"偶发不确定"变为"按名确定"), 故生产 combined/positions 将出现一次性的**定序对齐** (非新 bug); 之后逐日应恢复 n_drop=1 个位数换手。
+
+### 取证 (早前, 数据只到 09-22 时的初判 — 已被上节取代/修正)
 - **三连 run 的 pred 逐字节相同**: 09-21 `182d078d` / 09-22 `8f1f026f` / 09-23 `1a7a78d0` 的 `pred.pkl` 全历史 (488058 行) **maxdiff=0**; 与本机干净 e21 (钉 09-21, 32-run 实验 `20260907080005`) 也一致 (1.4e-17 浮点噪声)。
 - **但持仓路径大幅互异**: 同日期 target 名单三三互改 **339 / 274 / 386 天** (例: 2022-11-30 `8f1f026f` n=30 含 `SZ300751`, `1a7a78d0` n=29 不含)。**pred 相同 → 目标不同 = 纯回测执行层非确定。**
-- **本机无法复现 `8f1f026f` 的 30 只**: 干净 e21 (end 09-21, 数据 09-22) 本机两次都 **29 只无 300751**; 244 上 `probe_pos_s0`/`1a7a78d0` 也是 29。`8f1f026f` 是 244 上**唯一一次** 30 只, 且**只在 244 发生** → 244 回测执行偶发非确定 (24GB 训练机复现不出, 8GB 244 出现)。
 - **⚠️ 排雷: 本机早前跑出 30 只是我 driver 的 bug, 非 244 现象**: 自写 driver 用 `sys.argv=[...,"--skip-train"]` 后直接调 `run_rolling.main()` (**不经 fire**) → 用了默认 `skip_train=False, mode="append"` → **训练末窗** (`Appending window` 日志) → 往滚动实验多写 run (33) → 污染 ensemble。**教训: 复现生产行为必须走 `fire.Fire(main)` 或真 CLI**, 不能裸调 `main()` (`run_rolling.py` 用 `fire.Fire`; `skip_train` 是 fire 参数, `sys.argv` 对裸调无效)。
 - **244 vs 本机 rolling 实验 run 数曾差 1 (32 vs 33)** = 上述本机污染 run (`9ccd3c2a`/`3bab2564`), 已移出到 `mlruns_cache_probes_debug/`, 本机恢复 32。
 
-### 修复: `determinism_guard.py` 双哨兵 (接入 `run_rolling.py`, 零改 qlib 源码)
+### 哨兵: `determinism_guard.py` 双哨兵 (接入 `run_rolling.py`, 零改 qlib 源码)
 1. **`assert_pos_type_sorted(conf)`** (conf 载入后立即, fail-fast): 断言 `port_analysis_config.backtest.pos_type` 解析到**带 `sorted(` 的 `Position` 子类** (即 `custom_handler.SortedPosition`), 否则 `RuntimeError` 拒绝跑。防 08-04 类"漏带 sort / pos_type 未配"事故。已测: pos config 放行 / nopos config 拦截。
 2. **`record_and_check_positions(exp_name)`** (回测+save_positions 后): 把每日 target 名单 hash 成 `path_hash` 落 `logs/.determinism_state.json`, 并与**上次记录**比; 任一**已服务历史日期** target 变了 → 打印 `TARGET REWRITE DETECTED` 大字告警 (默认不 raise, `raise_on_rewrite=True` 可强制)。已测: 同 exp 连跑 `path_hash=0a9611c75ebd6c6e` 稳定 `status=OK`; 篡改历史 → 检测到; **回放 244 三连 run: `8f1f026f`→`1a7a78d0` 报 386 天改写** → 若当日装了哨兵必报警。
 - 端到端: 干净 e21 skip-train 全跑 → guard1 早打印, guard2 尾打印 `status=OK`, 滚动实验**仍 32 run** (无污染)。`sim/test_sim_merge.py` `3/3 passed`。
