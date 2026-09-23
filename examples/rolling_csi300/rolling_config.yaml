@@ -1,6 +1,6 @@
 benchmark: SH000300
 data_handler_config: &id001
-  end_time: '2026-09-04'
+  end_time: '2026-09-23'
   fit_end_time: 2018-12-31
   fit_start_time: 2008-01-01
   instruments: csi300
@@ -10,7 +10,7 @@ port_analysis_config: &id002
   backtest:
     account: 1000000
     benchmark: SH000300
-    end_time: '2026-09-04'
+    end_time: '2026-09-23'
     exchange_kwargs:
       close_cost: 0.0015
       deal_price: close
@@ -55,9 +55,14 @@ task:
   model:
     class: LGBModel
     kwargs:
+      bagging_seed: 0
       colsample_bytree: 0.8879
+      data_random_seed: 0
+      deterministic: true
       device: cpu
       early_stopping_rounds: 100
+      feature_fraction_seed: 0
+      force_row_wise: true
       gpu_use_dp: false
       lambda_l1: 205.6999
       lambda_l2: 580.9768
@@ -67,6 +72,7 @@ task:
       n_estimators: 1000
       num_leaves: 210
       num_threads: 20
+      seed: 0
       subsample: 0.8789
     module_path: qlib.contrib.model.gbdt
   record:

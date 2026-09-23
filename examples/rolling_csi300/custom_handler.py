@@ -193,7 +193,7 @@ class DeterministicTopkDropoutStrategy(TopkDropoutStrategy):
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 
-class VolatilityTimingStrategy(TopkDropoutStrategy):
+class VolatilityTimingStrategy(DeterministicTopkDropoutStrategy):
     """Dynamic topk based on CSI 300 volatility + trend regime.
 
     牛市高波（acceleration）→  stay invested
@@ -471,7 +471,7 @@ class ExpensiveFilterICTimingStrategy(ICTimingStrategy):
         buy_order_list = []
         cash = current_temp.get_cash()
         current_stock_list = current_temp.get_stock_list()
-        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        last = _deterministic_score_index(pred_score.reindex(current_stock_list))
 
         # CANDIDATE POOL: exclude *not-yet-held* expensive stocks from new buys.
         # Held expensive stocks stay (only-new-buy exclusion).
@@ -481,9 +481,9 @@ class ExpensiveFilterICTimingStrategy(ICTimingStrategy):
         ]
 
         if self.method_buy == "top":
-            today = list(cand_ok.sort_values(ascending=False).index)[: self.n_drop + self.topk - len(last)]
+            today = list(_deterministic_score_index(cand_ok))[: self.n_drop + self.topk - len(last)]
         elif self.method_buy == "random":
-            topk_candi = list(cand_ok.sort_values(ascending=False).index)[: self.topk]
+            topk_candi = list(_deterministic_score_index(cand_ok))[: self.topk]
             candi = [x for x in topk_candi if x not in last]
             n = self.n_drop + self.topk - len(last)
             try:
@@ -493,7 +493,7 @@ class ExpensiveFilterICTimingStrategy(ICTimingStrategy):
         else:
             raise NotImplementedError(f"This type of input is not supported")
 
-        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        comb = _deterministic_score_index(pred_score.reindex(last.union(pd.Index(today))))
         if self.method_sell == "bottom":
             sell = last[last.isin(pd.Index(list(comb)[-self.n_drop:]))]
         else:
@@ -992,7 +992,7 @@ class Alpha158DvRatio(Alpha158Industry):
         return fields, names
 
 
-class IndustryCappedStrategy(TopkDropoutStrategy):
+class IndustryCappedStrategy(DeterministicTopkDropoutStrategy):
     """TopK with gradual industry cap — phases out excess gradually to limit turnover."""
 
     def __init__(self, *, max_per_industry=4, industry_map_path=None, **kwargs):
@@ -1025,12 +1025,12 @@ class IndustryCappedStrategy(TopkDropoutStrategy):
         current_stock_list = current_temp.get_stock_list()
 
         # --- Step 1: normal TopkDropout candidate selection ---
-        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        last = _deterministic_score_index(pred_score.reindex(current_stock_list))
         today = get_first_n(
-            pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+            _deterministic_score_index(pred_score[~pred_score.index.isin(last)]),
             self.n_drop + self.topk - len(last),
         )
-        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        comb = _deterministic_score_index(pred_score.reindex(last.union(pd.Index(today))))
 
         # --- Step 2: apply industry cap to the candidate list ---
         # Count current industry exposure
@@ -1094,7 +1094,7 @@ class IndustryCappedStrategy(TopkDropoutStrategy):
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 
-class MinTradeValueStrategy(TopkDropoutStrategy):
+class MinTradeValueStrategy(DeterministicTopkDropoutStrategy):
     """TopkDropoutStrategy with a minimum trade value filter.
 
     Skips buy/sell orders whose notional value is below ``min_trade_value``,
@@ -1163,15 +1163,15 @@ class MinTradeValueStrategy(TopkDropoutStrategy):
         buy_order_list = []
         cash = current_temp.get_cash()
         current_stock_list = current_temp.get_stock_list()
-        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        last = _deterministic_score_index(pred_score.reindex(current_stock_list))
 
         if self.method_buy == "top":
             today = get_first_n(
-                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+                _deterministic_score_index(pred_score[~pred_score.index.isin(last)]),
                 self.n_drop + self.topk - len(last),
             )
         elif self.method_buy == "random":
-            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            topk_candi = get_first_n(_deterministic_score_index(pred_score), self.topk)
             candi = list(filter(lambda x: x not in last, topk_candi))
             n = self.n_drop + self.topk - len(last)
             try:
@@ -1181,7 +1181,7 @@ class MinTradeValueStrategy(TopkDropoutStrategy):
         else:
             raise NotImplementedError(f"This type of input is not supported")
 
-        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        comb = _deterministic_score_index(pred_score.reindex(last.union(pd.Index(today))))
 
         if self.method_sell == "bottom":
             sell = last[last.isin(get_last_n(comb, self.n_drop))]
