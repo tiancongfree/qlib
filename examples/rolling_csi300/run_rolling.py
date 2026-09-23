@@ -28,6 +28,7 @@ from qlib.utils.pickle_utils import add_safe_class
 import custom_handler  # noqa: F401 - register handler for pickle
 from rolling_append import AppendRolling
 from save_positions import save_positions_to_csv
+from determinism_guard import assert_pos_type_sorted, record_and_check_positions
 
 # Register custom classes so subprocesses can deserialize them
 add_safe_class("custom_handler", "Alpha158Momentum")
@@ -215,6 +216,11 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
         yaml.dump(conf, f)
     print(f"  Config end_time updated to {test_end}")
 
+    # Determinism guard 1/2 (fail fast): the backtest must use our sorted Position
+    # subclass, otherwise n_drop=1 results are set-order dependent (AGENTS.md 3b).
+    pos_type = assert_pos_type_sorted(conf)
+    print(f"  [det-guard] pos_type = {pos_type} (sorted, deterministic)")
+
     # Clean previous rolling experiments
     mlruns = Path(__file__).parent / "mlruns"
     if not mlruns.exists():
@@ -319,6 +325,11 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
 
     # Save daily positions to CSV
     save_positions_to_csv(exp_name=exp_name)
+
+    # Determinism guard 2/2: hash the served daily targets and warn if a date that
+    # a previous run already served now has a different target (retroactive rewrite
+    # -> live churn). See determinism_guard.py.
+    record_and_check_positions(exp_name=exp_name)
 
 
 if __name__ == "__main__":

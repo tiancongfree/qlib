@@ -874,6 +874,21 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 2. 对比 244 连续两天的 `positions_*.csv`, 同一历史日期的 `weight` 应**不再变化**
 3. 若仍 churn → 还有第三条改写路径, 需再查
 
+## 09-22/09-23 churn 第四处根因: 回测执行层非确定 (244), 哨兵已加 (2026-09-23)
+
+### 取证 (本机同步 244 数据到 09-22 后决定性复现)
+- **三连 run 的 pred 逐字节相同**: 09-21 `182d078d` / 09-22 `8f1f026f` / 09-23 `1a7a78d0` 的 `pred.pkl` 全历史 (488058 行) **maxdiff=0**; 与本机干净 e21 (钉 09-21, 32-run 实验 `20260907080005`) 也一致 (1.4e-17 浮点噪声)。
+- **但持仓路径大幅互异**: 同日期 target 名单三三互改 **339 / 274 / 386 天** (例: 2022-11-30 `8f1f026f` n=30 含 `SZ300751`, `1a7a78d0` n=29 不含)。**pred 相同 → 目标不同 = 纯回测执行层非确定。**
+- **本机无法复现 `8f1f026f` 的 30 只**: 干净 e21 (end 09-21, 数据 09-22) 本机两次都 **29 只无 300751**; 244 上 `probe_pos_s0`/`1a7a78d0` 也是 29。`8f1f026f` 是 244 上**唯一一次** 30 只, 且**只在 244 发生** → 244 回测执行偶发非确定 (24GB 训练机复现不出, 8GB 244 出现)。
+- **⚠️ 排雷: 本机早前跑出 30 只是我 driver 的 bug, 非 244 现象**: 自写 driver 用 `sys.argv=[...,"--skip-train"]` 后直接调 `run_rolling.main()` (**不经 fire**) → 用了默认 `skip_train=False, mode="append"` → **训练末窗** (`Appending window` 日志) → 往滚动实验多写 run (33) → 污染 ensemble。**教训: 复现生产行为必须走 `fire.Fire(main)` 或真 CLI**, 不能裸调 `main()` (`run_rolling.py` 用 `fire.Fire`; `skip_train` 是 fire 参数, `sys.argv` 对裸调无效)。
+- **244 vs 本机 rolling 实验 run 数曾差 1 (32 vs 33)** = 上述本机污染 run (`9ccd3c2a`/`3bab2564`), 已移出到 `mlruns_cache_probes_debug/`, 本机恢复 32。
+
+### 修复: `determinism_guard.py` 双哨兵 (接入 `run_rolling.py`, 零改 qlib 源码)
+1. **`assert_pos_type_sorted(conf)`** (conf 载入后立即, fail-fast): 断言 `port_analysis_config.backtest.pos_type` 解析到**带 `sorted(` 的 `Position` 子类** (即 `custom_handler.SortedPosition`), 否则 `RuntimeError` 拒绝跑。防 08-04 类"漏带 sort / pos_type 未配"事故。已测: pos config 放行 / nopos config 拦截。
+2. **`record_and_check_positions(exp_name)`** (回测+save_positions 后): 把每日 target 名单 hash 成 `path_hash` 落 `logs/.determinism_state.json`, 并与**上次记录**比; 任一**已服务历史日期** target 变了 → 打印 `TARGET REWRITE DETECTED` 大字告警 (默认不 raise, `raise_on_rewrite=True` 可强制)。已测: 同 exp 连跑 `path_hash=0a9611c75ebd6c6e` 稳定 `status=OK`; 篡改历史 → 检测到; **回放 244 三连 run: `8f1f026f`→`1a7a78d0` 报 386 天改写** → 若当日装了哨兵必报警。
+- 端到端: 干净 e21 skip-train 全跑 → guard1 早打印, guard2 尾打印 `status=OK`, 滚动实验**仍 32 run** (无污染)。`sim/test_sim_merge.py` `3/3 passed`。
+- **状态文件**: `logs/.determinism_state.json` 按 exp_name 分键存 (可跨实验/跨天比)。**注意**: 它记的是"本机见过的 target", 跨机不共享; 244 首次跑会新建记录, 从第二个交易日起才有跨天比对意义。
+
 ### 244 持仓 vs 冻结后 target 的偏离 (2026-09-18 口径, 读数只读)
 - 总资产 974,592 / 股票市值 776,960 / 现金 197,632 (利用率 ~79.7%); 实际持有 **24 只**, qlib target **31 只** (wt>0.5%)
 - 交集 23 只 → **overlap/held 95.8%, overlap/target 74.2%**
