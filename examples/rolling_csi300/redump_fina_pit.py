@@ -126,22 +126,27 @@ def main(limit: int = 0):
     tmp_dir = Path(tempfile.mkdtemp(prefix="fund_pit2_"))
     print(f"  PIT tmp dir: {tmp_dir}")
 
-    n_csv = 0
-    n_rows = 0
-    for i, code in enumerate(codes):
-        rows = dump_fina_pit(pro, code, tmp_dir)
-        if rows > 0:
-            n_csv += 1
-            n_rows += rows
-        if (i + 1) % 50 == 0:
-            print(f"  [{i+1}/{len(codes)}] ...")
+    try:
+        n_csv = 0
+        n_rows = 0
+        for i, code in enumerate(codes):
+            rows = dump_fina_pit(pro, code, tmp_dir)
+            if rows > 0:
+                n_csv += 1
+                n_rows += rows
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+1}/{len(codes)}] ...")
 
-    print(f"  {n_csv} CSVs, {n_rows} rows")
+        print(f"  {n_csv} CSVs, {n_rows} rows")
 
-    print("[3] Dumping PIT data...")
-    dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
-    dp.dump(interval="quarterly", overwrite=True)
-    print("Done!")
+        print("[3] Dumping PIT data...")
+        dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
+        dp.dump(interval="quarterly", overwrite=True)
+        print("Done!")
+    finally:
+        # always clean the scratch dir (leaks /tmp/fund_pit2_* on any error)
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

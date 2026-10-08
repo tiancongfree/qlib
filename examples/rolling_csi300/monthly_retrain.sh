@@ -47,6 +47,9 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/monthly_retrain_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee "$LOG") 2>&1
 
+# Scratch dir for the deploy bundles; always removed on exit (see trap below).
+TMP=""
+
 echo "=============================================="
 echo "Monthly rolling retrain started: $(date)"
 echo "=============================================="
@@ -88,6 +91,13 @@ disable_retrain_swap() {
     fi
 }
 
+cleanup_retrain() {
+    disable_retrain_swap
+    if [[ -n "$TMP" && -d "$TMP" ]]; then
+        rm -rf "$TMP"
+    fi
+}
+
 # ---- 2. retrain (append-only by default) ----
 echo ""
 if [[ "$MODE" == "append" ]]; then
@@ -95,7 +105,7 @@ if [[ "$MODE" == "append" ]]; then
 else
     echo "[2/5] FULL: retraining all rolling windows..."
 fi
-trap 'disable_retrain_swap' EXIT   # tear swap back down no matter how the run ends
+trap 'cleanup_retrain' EXIT   # tear swap + scratch dir down no matter how the run ends
 enable_retrain_swap
 "$PY" run_rolling.py --mode "$MODE" --exp-name "$EXP"
 
@@ -226,6 +236,8 @@ cp /mnt/c/Users/tc/Desktop/rolling_exp.tar.gz /tmp/ 2>/dev/null
 cp /mnt/c/Users/tc/Desktop/combined_pred.tar.gz /tmp/ 2>/dev/null
 tar xzf /mnt/c/Users/tc/Desktop/rolling_exp.tar.gz -C . 
 tar xzf /mnt/c/Users/tc/Desktop/combined_pred.tar.gz -C .
+# remove the scratch copies so they don't accumulate in /tmp on the trading box
+rm -f /tmp/rolling_exp.tar.gz /tmp/combined_pred.tar.gz
 if ls /mnt/c/Users/tc/Desktop/Alpha158Industry.*.pkl >/dev/null 2>&1; then
     cp /mnt/c/Users/tc/Desktop/Alpha158Industry.*.pkl .
     md5sum Alpha158Industry.*.pkl

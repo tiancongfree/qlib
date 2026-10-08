@@ -260,29 +260,34 @@ def main(limit: int = 0):
     tmp_dir = Path(tempfile.mkdtemp(prefix="fund_pit_"))
     print(f"  PIT tmp dir: {tmp_dir}")
 
-    print("\n[1] Dumping daily_basic valuation features...")
-    n_ok = 0
-    for i, code in enumerate(codes):
-        before = {f: (QLIB_DIR / "features" / to_fname(code) / f"{f}.day.bin").exists() for f in DAILY_BASIC_FIELDS}
-        dump_daily_basic_bins(pro, code, code)
-        after = {f: (QLIB_DIR / "features" / to_fname(code) / f"{f}.day.bin").exists() for f in DAILY_BASIC_FIELDS}
-        if any(after.values()):
-            n_ok += 1
-        if (i + 1) % 50 == 0:
-            print(f"  [{i+1}/{len(codes)}] ...")
-    print(f"  daily_basic done: {n_ok}/{len(codes)} stocks have bins")
+    try:
+        print("\n[1] Dumping daily_basic valuation features...")
+        n_ok = 0
+        for i, code in enumerate(codes):
+            before = {f: (QLIB_DIR / "features" / to_fname(code) / f"{f}.day.bin").exists() for f in DAILY_BASIC_FIELDS}
+            dump_daily_basic_bins(pro, code, code)
+            after = {f: (QLIB_DIR / "features" / to_fname(code) / f"{f}.day.bin").exists() for f in DAILY_BASIC_FIELDS}
+            if any(after.values()):
+                n_ok += 1
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+1}/{len(codes)}] ...")
+        print(f"  daily_basic done: {n_ok}/{len(codes)} stocks have bins")
 
-    print("\n[2] Building fina_indicator PIT CSVs...")
-    for i, code in enumerate(codes):
-        dump_fina_pit(pro, code, code, tmp_dir)
-        if (i + 1) % 50 == 0:
-            print(f"  [{i+1}/{len(codes)}] ...")
+        print("\n[2] Building fina_indicator PIT CSVs...")
+        for i, code in enumerate(codes):
+            dump_fina_pit(pro, code, code, tmp_dir)
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+1}/{len(codes)}] ...")
 
-    print("\n[3] Dumping PIT data into financial/ ...")
-    dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
-    dp.dump(interval="quarterly", overwrite=True)
+        print("\n[3] Dumping PIT data into financial/ ...")
+        dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
+        dp.dump(interval="quarterly", overwrite=True)
 
-    print("\nDone!")
+        print("\nDone!")
+    finally:
+        # always clean the scratch dir (leaks /tmp/fund_pit_* on any error)
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -199,24 +199,29 @@ def main():
         return
 
     tmpdir = Path(tempfile.mkdtemp(prefix="qlib_backfill_"))
-    csv_dir = tmpdir / "csv"
-    csv_dir.mkdir(parents=True)
-    for fname, grp in new_data.groupby("symbol"):
-        grp.to_csv(csv_dir / f"{fname}.csv", index=False)
-    print(f"  Saved {len(list(csv_dir.glob('*.csv')))} CSVs")
+    try:
+        csv_dir = tmpdir / "csv"
+        csv_dir.mkdir(parents=True)
+        for fname, grp in new_data.groupby("symbol"):
+            grp.to_csv(csv_dir / f"{fname}.csv", index=False)
+        print(f"  Saved {len(list(csv_dir.glob('*.csv')))} CSVs")
 
-    du = DumpDataUpdate(
-        data_path=str(csv_dir),
-        qlib_dir=str(QLIB_DIR),
-        freq="day",
-        max_workers=8,
-        date_field_name="date",
-        file_suffix=".csv",
-        symbol_field_name="symbol",
-        exclude_fields="symbol,date",
-    )
-    du.dump()
-    print("  DumpDataUpdate done.")
+        du = DumpDataUpdate(
+            data_path=str(csv_dir),
+            qlib_dir=str(QLIB_DIR),
+            freq="day",
+            max_workers=8,
+            date_field_name="date",
+            file_suffix=".csv",
+            symbol_field_name="symbol",
+            exclude_fields="symbol,date",
+        )
+        du.dump()
+        print("  DumpDataUpdate done.")
+    finally:
+        # always clean the scratch dir (leaks /tmp/qlib_backfill_* on any error)
+        import shutil as _shutil
+        _shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Verify
     last_dates2 = stock_last_date(calendar)

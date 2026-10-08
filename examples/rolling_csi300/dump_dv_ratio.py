@@ -183,23 +183,28 @@ def main(limit: int = 0):
     tmp_dir = Path(tempfile.mkdtemp(prefix="dv_ratio_pit_"))
     print(f"  PIT tmp dir: {tmp_dir}")
 
-    n_csv = 0
-    n_rows = 0
-    t0 = time.time()
-    for i, code in enumerate(codes):
-        rows = dump_stock(pro, code, tmp_dir)
-        if rows > 0:
-            n_csv += 1
-            n_rows += rows
-        if (i + 1) % 100 == 0:
-            print(f"  [{i+1}/{len(codes)}] {time.time()-t0:.0f}s")
+    try:
+        n_csv = 0
+        n_rows = 0
+        t0 = time.time()
+        for i, code in enumerate(codes):
+            rows = dump_stock(pro, code, tmp_dir)
+            if rows > 0:
+                n_csv += 1
+                n_rows += rows
+            if (i + 1) % 100 == 0:
+                print(f"  [{i+1}/{len(codes)}] {time.time()-t0:.0f}s")
 
-    print(f"\n  {n_csv} CSVs, {n_rows} rows, {time.time()-t0:.0f}s")
+        print(f"\n  {n_csv} CSVs, {n_rows} rows, {time.time()-t0:.0f}s")
 
-    print("\n[3] Dumping PIT data into financial/ ...")
-    dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
-    dp.dump(interval="quarterly", overwrite=True)
-    print("Done!")
+        print("\n[3] Dumping PIT data into financial/ ...")
+        dp = DumpPitData(csv_path=str(tmp_dir), qlib_dir=str(QLIB_DIR), max_workers=8)
+        dp.dump(interval="quarterly", overwrite=True)
+        print("Done!")
+    finally:
+        # always clean the scratch dir (leaks /tmp/dv_ratio_pit_* on any error)
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
