@@ -29,6 +29,12 @@ import custom_handler  # noqa: F401 - register handler for pickle
 from rolling_append import AppendRolling
 from save_positions import save_positions_to_csv
 from determinism_guard import assert_pos_type_sorted, record_and_check_positions
+import tmp_leak_guard
+
+# Install the /tmp temp-dir leak guard before any mlflow save_objects call
+# (qlib's Recorder.save_objects lacks a try/finally cleanup -> leaks /tmp/tmpXXXX
+# dirs on any exception, filling the host disk).  See tmp_leak_guard.py.
+tmp_leak_guard.install()
 
 # Register custom classes so subprocesses can deserialize them
 add_safe_class("custom_handler", "Alpha158Momentum")

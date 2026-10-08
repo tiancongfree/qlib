@@ -44,6 +44,12 @@ import custom_handler  # noqa: F401
 add_safe_class("custom_handler", "Alpha158Industry")
 add_safe_class("custom_handler", "IndustryProcessor")
 
+import tmp_leak_guard
+
+# Guard against qlib Recorder.save_objects leaking /tmp/tmpXXXX dirs on error
+# (missing try/finally upstream).  See tmp_leak_guard.py.
+tmp_leak_guard.install()
+
 DEFAULT_EXP = "rolling_csi300_lgbm_ndrop1"
 
 

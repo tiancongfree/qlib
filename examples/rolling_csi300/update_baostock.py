@@ -1248,22 +1248,27 @@ def main():
     if not new_stock_data.empty:
         print("\n[5b] Dumping new stocks (full history) via DumpDataUpdate...")
         tmpdir = Path(tempfile.mkdtemp(prefix="qlib_upd_"))
-        csv_dir = tmpdir / "csv"
-        csv_dir.mkdir(parents=True)
-        for fname, grp in new_stock_data.groupby("symbol"):
-            grp.to_csv(csv_dir / f"{fname}.csv", index=False)
-        print(f"  Saved {len(list(csv_dir.glob('*.csv')))} CSVs to {csv_dir}")
-        du = DumpDataUpdate(
-            data_path=str(csv_dir),
-            qlib_dir=str(QLIB_DIR),
-            freq="day",
-            max_workers=8,
-            date_field_name="date",
-            file_suffix=".csv",
-            symbol_field_name="symbol",
-            exclude_fields="symbol,date",
-        )
-        du.dump()
+        try:
+            csv_dir = tmpdir / "csv"
+            csv_dir.mkdir(parents=True)
+            for fname, grp in new_stock_data.groupby("symbol"):
+                grp.to_csv(csv_dir / f"{fname}.csv", index=False)
+            print(f"  Saved {len(list(csv_dir.glob('*.csv')))} CSVs to {csv_dir}")
+            du = DumpDataUpdate(
+                data_path=str(csv_dir),
+                qlib_dir=str(QLIB_DIR),
+                freq="day",
+                max_workers=8,
+                date_field_name="date",
+                file_suffix=".csv",
+                symbol_field_name="symbol",
+                exclude_fields="symbol,date",
+            )
+            du.dump()
+        finally:
+            # always clean the scratch dir (leaks /tmp/qlib_upd_* on any error)
+            import shutil as _shutil
+            _shutil.rmtree(tmpdir, ignore_errors=True)
 
     # 6. Verify
     print("\n[6] Verification...")
