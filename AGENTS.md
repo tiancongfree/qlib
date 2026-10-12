@@ -831,10 +831,10 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 
 ### 09-20/09-21 cron 重训"静默死亡"排查结论 (非本 bug, 环境因素)
 - **现象**: catchup 于 09-20 18:23 / 09-21 18:22 触发 append, 日志停在 `[2/5] APPEND: retraining...` 后**零输出**直接 `catch-up retrain FAILED`。
-- **排查**: `who -b` 显示 WSL **2026-09-21 18:22 刚重启**, cron 恰在开机同刻由 `~/.profile` 登录 catchup 拉起 → **开机内存/IO 高压下 run_rolling 被 OOM-kill** (无 OOM 日志, 缓冲丢失)。非代码 bug。
-- **复现验证**: 机器稳定后手动跑完整 `monthly_retrain_catchup.sh` (setsid 脱离会话) → **全链路成功**: `[1/5]` 数据(900s 超时 WARN) → `[2/5]` append 训练 → `[3/5]` locate → `[4/5]` bundle → `[5/5]` 部署 244 → `Monthly retrain done`; `.last_retrain=20260921 19:23`。
+- **旧结论 (已作废, 2026-10-12 更正)**: 曾判为"开机内存/IO 高压下 run_rolling 被 OOM-kill (无 OOM 日志, 缓冲丢失)"。**复核推翻**: guest 内核日志**无任何 OOM / hung task / segfault / oomd kill** (`journalctl -b` 干净), 且失败后**无 swapoff** (`EXIT` trap 未跑) → 不是 OOM, 是**被信号杀死, 信号来自 guest 之外** (故 guest 无日志)。
+- **精确定位**: 失败 run 的 log 末次写入时间 == 同刻 `sudo swapon /swapfile19G` 的 auth.log 时间 (逐秒吻合); 只在**开机同刻**触发的重训发生 (稳态登录触发的都成功; swap 已被上次失败留在开启态时, 下次跳过 swapon 即成功)。真因与修复见下节。
+- **复现验证 (旧)**: 机器稳定后手动跑完整 `monthly_retrain_catchup.sh` (setsid 脱离会话) → **全链路成功**; `.last_retrain=20260921 19:23`。
 - **freeze 生效实测**: 新 combined run (`d0feed7021ec`) vs 原 served run (`b254df1a408a`) → **common 487758 行, maxdiff=0.0, changed=0, tail 均 09-18** → 已服务历史零改写 (方案A 生效)。
-- **教训**: catchup 在**开机同刻**触发易被 OOM 杀; 若再次"静默死亡", 先 `uptime` 看是否刚重启, 稳定后手动补跑即可 (不必改码)。
 
 ### 部署 (2026-09-21)
 - 本机 commit `5ca83865` (on top of `8c01b59c`) → `git bundle create … 6f9c18eff..snapshot/rolling_csi300` → scp 到 244 → `git fetch /tmp/xxx.bundle snapshot/rolling_csi300 && git merge --ff-only FETCH_HEAD`。
@@ -842,10 +842,43 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **追加部署 `b495815a`** (`5ca83865..snapshot/rolling_csi300` bundle): 244 → **`b495815a9`** (fast-forward, 含 `3c27c78a` 文档)。`rolling_append.py` sha256 `00012c3b…`、`test_sim_merge.py` `136b42e4…` 两机一致; 244 回归 `3/3 passed`。
 - **追加部署健康 guard `5ed7d906`** (`cf97f25f..snapshot/rolling_csi300` bundle): 244 → **`5ed7d9062`**; `retrain_guard.py` sha256 `20ec1087…`、`dd_alert.py` `ce820659…`、`monthly_retrain.sh` `43d8e67a…` 两机逐字节一致; 244 端 guard 冒烟 `All checks passed` (exit 0)。
 
+## 训练机"开机静默死亡"根因+修复 (setsid, 2026-10-12, 重要)
+
+### 根因 (推翻旧"OOM"说)
+- 开机同刻由 Windows 登录任务 / `~/.profile` 拉起的**第一次**重训, 在 `enable_retrain_swap` 执行 `sudo swapon /swapfile19G` 的瞬间被**外部信号终止** (guest 无 OOM/segfault; `EXIT` trap 未跑 → 无 swapoff; 零输出)。稳态(非开机)触发的重训、或 swap 已开时的重训都正常。
+- 定位证据: 多次失败 run 的 log mtime 与其 `sudo swapon` 时间**逐秒吻合** (Sep20 18:23:40 / Sep21 18:36:52 / Sep23 19:04:37 / Sep28 09:51:40 / Oct8 19:14:33 / Oct9 18:49:13 / Oct12 18:56:01); 单独复跑 `sudo swapon` (含 `exec > >(tee)`/setsid/nohup 变体) **全部存活** → 不是 swapon 命令本身, 而是**启动会话被拆**连坐 Linux 进程树 (与 §08-29 "nohup 在会话断开被杀, 须 setsid" 同源)。
+
+### 修复
+1. **脱离会话**: `~/.profile` 的登录 catchup 由 `nohup` 改 **`setsid`**; Windows `wake_train_wsl_catchup.bat` 的 `wsl.exe … bash -lc` 里也改成 `setsid … &` (隐藏调用不再 `pause` 常驻)。→ 重训进程 PPID=1, 会话被拆也杀不到。
+2. **诊断留痕** (`monthly_retrain.sh`): `export PYTHONUNBUFFERED=1`; `stage()` 把"最后到达步骤"写到 `logs/.retrain_stage` (独立 fd, 不经 tee, SIGKILL 也留); 信号 trap `HUP/INT/TERM/QUIT` 记录信号名+ppid/pgid/sid; 关键步骤 + swapon 前全改走 `stage()`。
+
+### 验证 (2026-10-12 重启实测)
+- 重启后 onlogon catchup 拉起重训, 进程 PPID=**1** (setsid 生效), `20:20:07` 成功 `Adding 19922940k swap` **未死**, 一路 `[2/5]→[5/5]→guard → Monthly retrain done`, `.last_retrain` 刷新, **无 `RECEIVED SIGNAL`**。
+- 结论: 根因 = 启动会话被拆; setsid 修复。`~/.profile` / `.bat` 不在 git, `monthly_retrain.sh` 在 git。
+
+## 训练机数据改为从 244 同步 (datasync/, health-gated, 2026-10-12)
+
+### 背景
+- 训练机自带 `update_baostock.py` (baostock 主 + akshare 兜底), 但 `monthly_retrain.sh` 用 `timeout 900` 包住, baostock 慢时 (~1 股/s) 在循环中途被杀; **akshare 兜底只在整轮 baostock 跑完后才启用 → 永远走不到** → 训练机数据卡住 (09-24, 而 244 已是 10-09)。
+- 244 (`update_data_only.ps1`) 调 `update_baostock.py` **无 timeout**, 能跑完 → 数据新鲜; 244 是消费端每日更新, 是权威数据源。
+
+### 实现 (`examples/rolling_csi300/datasync/`)
+- `data_health.py`: 健康检查 (calendar 递增+新鲜度 / csi300 最新段 300 / 抽样 `.bin` 完好且贴近末日 / 数据目录可写 / 剩余磁盘); 两端通用。
+- `remote_pack.py`: 244 侧先 health, OK 才打包 (`calendars`+`instruments` 全量 + `features/**.bin` 中 mtime > `--since`), 输出 `DATA_SYNC_MARKER`。
+- `run_remote.sh`: 244 侧入口 (免嵌套引号)。
+- `sync_from_244.sh`: 训练机侧编排 (推脚本 → 244 health+pack → scp 回 → 解压覆盖 → **本地再 health** → 成功才推进 marker `logs/.data_sync_marker`); **任一步失败 → 本地数据不动, 退出非 0**。
+- `monthly_retrain.sh` [1/5] 改为调 `sync_from_244.sh`; 失败回退旧 `timeout 900 update_baostock.py`。
+- 注: 暂不同步 `financial/` (Alpha158Industry 不用)。
+
+### 验证 (2026-10-12)
+- 首次全量: 244 HEALTH OK (10-09 / lag3 / csi300 300) → 61220 文件 559MB → 本地 HEALTH OK, **1m20s**。
+- 增量 (marker 已存): 0 bin 变化 → 688KB, **3s**。
+- 训练机 qlib 现看到交易日到 **2026-10-09**, 10-09 csi300 = 300 只。
+
 ## 重训健康 guard (retrain_guard.py, 2026-09-21, 重要)
 
 ### 动机
-- `monthly_retrain.sh` 里数据更新/scp/244 部署都是 `|| echo WARN` (不中断), 且 09-20/21 出现"静默死亡"(开机同刻 OOM, 无输出) → **日志打 `Monthly retrain done` 不等于成功**, 而 `.last_retrain` 却会被推进 → catchup 以为成功、不再重试, 下游可能拿到**滞后/冻结的 pred**。
+- `monthly_retrain.sh` 里数据更新/scp/244 部署都是 `|| echo WARN` (不中断), 且 09-20/21 出现"静默死亡"(开机同刻被外部信号杀, 无输出; **非 OOM**, 见下节) → **日志打 `Monthly retrain done` 不等于成功**, 而 `.last_retrain` 却会被推进 → catchup 以为成功、不再重试, 下游可能拿到**滞后/冻结的 pred**。
 
 ### 机制
 - `retrain_guard.py` 作为 **`monthly_retrain.sh` 的最后一步**运行; **只有 guard 通过**才写 `logs/.last_retrain`; 失败 → `exit 1`, **不推进 state** → `monthly_retrain_catchup.sh` 下次定时自动重试。

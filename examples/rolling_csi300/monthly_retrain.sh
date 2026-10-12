@@ -16,7 +16,8 @@
 # 2020->today report) is MANUAL:  MODE=full bash monthly_retrain.sh
 #
 # Flow (APPEND):
-#   1. update qlib data from baostock/akshare
+#   1. sync qlib data FROM the serving machine (244), health-gated both ends
+#      (datasync/sync_from_244.sh).  Fallback = local update_baostock.py.
 #   2. append newest window (run_rolling.py --mode append) into latest
 #      rolling_models_*, re-ensemble combined pred to latest date
 #   3. bundle the reused rolling experiment + updated combined pred
@@ -32,6 +33,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 PY=/home/tc/qlib/.venv/bin/python
+# Unbuffered child output: the boot-time "silent death" loses block-buffered
+# stdout when the process is signal-killed, so Python must flush every line.
+export PYTHONUNBUFFERED=1
 SSH_KEY=~/.ssh/id_ed25519_new
 REMOTE="tc@192.168.11.244"
 EXP=rolling_csi300_lgbm_ndrop1
@@ -47,17 +51,56 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/monthly_retrain_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee "$LOG") 2>&1
 
+# Lightweight stage marker.  Written to a dedicated file (NOT through the tee
+# pipe), so the last-reached step survives even when the process is
+# signal-killed mid-step and the tee buffer is lost.  This is what lets us
+# pinpoint the boot-time "silent death" (2026-09/10: every fresh-boot retrain
+# died right at the in-run `sudo swapon /swapfile19G` with zero log output).
+STAGE_FILE="$LOG_DIR/.retrain_stage"
+stage() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" > "$STAGE_FILE" 2>/dev/null || true
+    echo "$*"
+}
+
+# Signal diagnostics: the boot-time deaths had NO guest OOM/segfault and the
+# EXIT trap never ran -> an external signal killed us.  Record which one and the
+# process context so the next occurrence is diagnosable.
+on_signal() {
+    local ctx
+    ctx="ppid=$(ps -o ppid= -p $$ 2>/dev/null) pgid=$(ps -o pgid= -p $$ 2>/dev/null) sid=$(ps -o sid= -p $$ 2>/dev/null)"
+    printf '%s RECEIVED SIGNAL %s (%s) log=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$ctx" "$LOG" > "$STAGE_FILE" 2>/dev/null || true
+    echo ""
+    echo "!! monthly_retrain RECEIVED SIGNAL $1 at $(date) ($ctx) log=$LOG"
+    exit 128
+}
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal QUIT' QUIT
+
 # Scratch dir for the deploy bundles; always removed on exit (see trap below).
 TMP=""
 
 echo "=============================================="
-echo "Monthly rolling retrain started: $(date)"
+stage "Monthly rolling retrain started: $(date)"
 echo "=============================================="
 
-# ---- 1. update data ----
+# ---- 1. sync data from 244 (health-gated), fallback to local update ----
 echo ""
-echo "[1/5] Updating qlib data..."
-timeout 900 "$PY" update_baostock.py || echo "  WARN: data update failed, continuing with existing data"
+stage "[1/5] Syncing qlib data from 244 (health-gated)..."
+# The training machine's own baostock download crawls (~1 stock/s) and was killed
+# by the old `timeout 900` BEFORE the akshare fallback (which only runs after a
+# full baostock pass) -> data stuck ~2 weeks behind.  244 updates nightly with no
+# timeout and is the authoritative fresh copy, so pull from there instead.  The
+# sync health-checks 244 first and our data after; any failure leaves local data
+# untouched and we fall back to the old local update.
+if bash "$HERE/datasync/sync_from_244.sh"; then
+    stage "  data synced from 244"
+else
+    stage "  WARN: 244 sync failed or 244 unhealthy -> falling back to local update_baostock.py"
+    timeout 900 "$PY" update_baostock.py || echo "  WARN: data update failed, continuing with existing data"
+fi
 
 # ---- 1b. pull the serving-machine served tail (append guard) ----
 # The append path refuses to run when this (training) machine's combined pred tail
@@ -66,7 +109,7 @@ timeout 900 "$PY" update_baostock.py || echo "  WARN: data update failed, contin
 # We pull 244's authoritative logs/.served_tail so the guard compares against the
 # true serving tail.  Non-fatal: if the pull fails we keep the existing local file.
 echo ""
-echo "[1b] Pulling served-tail marker from 244 (append guard)..."
+stage "[1b] Pulling served-tail marker from 244 (append guard)..."
 SERVED_TAIL_REMOTE='/mnt/c/Users/tc/qlib_served_tail'
 if ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$REMOTE" \
         "wsl -u tc bash -lc 'cp /home/tc/qlib/examples/rolling_csi300/logs/.served_tail /mnt/c/Users/tc/qlib_served_tail 2>/dev/null'" \
@@ -95,15 +138,18 @@ swapon_has() { swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$1"; }
 
 enable_retrain_swap() {
     if swapon_has "$RETRAIN_SWAP"; then
-        echo "retrain swap already active: $RETRAIN_SWAP"
+        stage "retrain swap already active: $RETRAIN_SWAP"
         return
     fi
+    # Mark BEFORE the swapon call: the boot-time deaths happened exactly here
+    # (the stage file still records this line even if we are killed mid-call).
+    stage "activating retrain swap: $RETRAIN_SWAP"
     if [[ -f "$RETRAIN_SWAP" ]] && sudo -n swapon "$RETRAIN_SWAP" 2>/dev/null; then
         SWAP_DID_ON=1
-        SZ=$(swapon --show=NAME,SIZE --bytes --ifexists 2>/dev/null | awk -v s="$RETRAIN_SWAP" '$1==s{printf "%.1fGB", $2/1e9}')
-        echo "enabled retrain swap: $RETRAIN_SWAP ($SZ)"
+        SZ=$(swapon --show=NAME,SIZE --bytes --ifexists 2>/dev/null | awk -v s="$RETRAIN_SWAP" '$1==s{printf "%.1fGB", $2/1e9}' || true)
+        stage "enabled retrain swap: $RETRAIN_SWAP ($SZ)"
     else
-        echo "WARN: could not enable retrain swap $RETRAIN_SWAP - training may OOM"
+        stage "WARN: could not enable retrain swap $RETRAIN_SWAP - training may OOM"
     fi
 }
 
@@ -124,9 +170,9 @@ cleanup_retrain() {
 # ---- 2. retrain (append-only by default) ----
 echo ""
 if [[ "$MODE" == "append" ]]; then
-    echo "[2/5] APPEND: retraining ONLY the newest rolling window..."
+    stage "[2/5] APPEND: retraining ONLY the newest rolling window..."
 else
-    echo "[2/5] FULL: retraining all rolling windows..."
+    stage "[2/5] FULL: retraining all rolling windows..."
 fi
 trap 'cleanup_retrain' EXIT   # tear swap + scratch dir down no matter how the run ends
 enable_retrain_swap
@@ -134,7 +180,7 @@ enable_retrain_swap
 
 # ---- 3. locate (reused/appended or newly-created) rolling experiment ----
 echo ""
-echo "[3/5] Locating rolling experiment..."
+stage "[3/5] Locating rolling experiment..."
 # Prefer the experiment whose pred-bearing run count is the highest (an interrupted
 # full retrain leaves only a few window preds and must not win over the exp we just
 # appended to).  Tie-break -> newest creation.  This mirrors run_rolling's
@@ -187,7 +233,7 @@ PY
 
 # ---- 4. bundle rolling experiment + pred, scp to 244 ----
 echo ""
-echo "[4/5] Bundling rolling experiment + pred -> 244..."
+stage "[4/5] Bundling rolling experiment + pred -> 244..."
 EXP_ID=$("$PY" << PY
 import mlflow, os
 client = mlflow.tracking.MlflowClient()
@@ -251,7 +297,7 @@ fi
 
 # ---- 5. extract on 244 (WSL) ----
 echo ""
-echo "[5/5] Extracting on 244..."
+stage "[5/5] Extracting on 244..."
 cat > "$TMP/deploy.sh" << 'EOF'
 #!/bin/bash
 cd /home/tc/qlib/examples/rolling_csi300
@@ -285,12 +331,11 @@ echo "=============================================="
 # logs/.retrain_health.json and emails an alert, and we DO NOT advance the state
 # so monthly_retrain_catchup.sh retries on its next scheduled run.
 echo ""
-echo "[guard] Verifying retrain artifacts..."
+stage "[guard] Verifying retrain artifacts..."
 if "$PY" retrain_guard.py --exp "$EXP"; then
     STATE="${STATE:-$LOG_DIR/.last_retrain}"
     printf '%s %s\n' "$(date '+%Y%m%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M')" > "$STATE"
-    echo "Wrote last-retrain state: $STATE"
-    echo "$(cat "$STATE")"
+    stage "Wrote last-retrain state: $(cat "$STATE")"
     echo ""
     echo "=============================================="
     echo "Monthly retrain done (guard passed): $(date)"
