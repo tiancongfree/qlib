@@ -59,6 +59,29 @@ echo ""
 echo "[1/5] Updating qlib data..."
 timeout 900 "$PY" update_baostock.py || echo "  WARN: data update failed, continuing with existing data"
 
+# ---- 1b. pull the serving-machine served tail (append guard) ----
+# The append path refuses to run when this (training) machine's combined pred tail
+# lags the last date the serving machine already served (2026-09-28 incident:
+# a manual append on the training machine rewrote 09-21..24 that 244 had served).
+# We pull 244's authoritative logs/.served_tail so the guard compares against the
+# true serving tail.  Non-fatal: if the pull fails we keep the existing local file.
+echo ""
+echo "[1b] Pulling served-tail marker from 244 (append guard)..."
+SERVED_TAIL_REMOTE='/mnt/c/Users/tc/qlib_served_tail'
+if ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$REMOTE" \
+        "wsl -u tc bash -lc 'cp /home/tc/qlib/examples/rolling_csi300/logs/.served_tail /mnt/c/Users/tc/qlib_served_tail 2>/dev/null'" \
+        >/dev/null 2>&1; then
+    if scp -i "$SSH_KEY" -o ConnectTimeout=10 \
+            "$REMOTE:/C:/Users/tc/qlib_served_tail" "$LOG_DIR/.served_tail" \
+            >/dev/null 2>&1; then
+        echo "  pulled served tail: $(cat "$LOG_DIR/.served_tail" 2>/dev/null)"
+    else
+        echo "  WARN: could not scp served tail from 244 (keeping local)"
+    fi
+else
+    echo "  WARN: could not read served tail on 244 (keeping local)"
+fi
+
 # ---- retrain swap window (on-demand, torn down when retrain exits) ----
 # The heavy run_rolling.py train peaks ~13GB anon in one subprocess.  The host
 # has only a 4GiB /dev/sdc swap active by default, which is not enough -> OOM

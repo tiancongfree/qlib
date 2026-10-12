@@ -29,6 +29,13 @@ import custom_handler  # noqa: F401 - register handler for pickle
 from rolling_append import AppendRolling
 from save_positions import save_positions_to_csv
 from determinism_guard import assert_pos_type_sorted, record_and_check_positions
+from serving_guard import (
+    assert_serving_machine,
+    assert_served_tail_not_ahead,
+    mark_served_tail,
+    current_host,
+    consumer_hosts,
+)
 import tmp_leak_guard
 
 # Install the /tmp temp-dir leak guard before any mlflow save_objects call
@@ -174,8 +181,20 @@ def _latest_combined_pred(exp_name: str):
         return None
 
 
+def _combined_pred_tail(exp_name: str):
+    """Return the max datetime present in the combined pred, or None."""
+    pred = _latest_combined_pred(exp_name)
+    if pred is None:
+        return None
+    try:
+        import pandas as _pd
+        return _pd.Timestamp(pred.index.get_level_values("datetime").max())
+    except Exception:
+        return None
+
+
 def main(skip_train: bool = False, mode: str = "append", conf: str = None,
-         exp_name: str = "rolling_csi300_lgbm"):
+         exp_name: str = "rolling_csi300_lgbm", force_append: bool = False):
     """Run rolling training + backtest.
 
     Parameters
@@ -200,6 +219,13 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
     exp_name : str
         Name of the output (combined) mlflow experiment. Defaults to
         ``rolling_csi300_lgbm``.
+    force_append : bool
+        Override the serving-machine / served-tail guard.  The append and skip-train
+        paths MUST run on a sanctioned machine (the training machine, or the serving
+        machine whose daily pipeline advances the combined pred); running them
+        elsewhere -- or with a combined pred tail that lags what the serving machine
+        already served -- can overwrite already-served dates when the result is
+        pushed to the serving machine (2026-09-28 incident).  See serving_guard.py.
     """
     global CONF_PATH
     CONF_PATH = Path(conf) if conf else DEFAULT_CONF
@@ -250,6 +276,20 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
     if not skip_train and mode == "full":
         # full rebuild -> start fresh, do not reuse stale windows
         rolling_exp = None
+
+    # Serving guard: the append/skip-train paths freeze the combined pred that
+    # THIS machine produced.  An unsanctioned machine (not the training env1 nor the
+    # serving 244) must not produce an append that later gets pushed into the
+    # serving pipeline.  In addition, if this machine's combined pred tail lags the
+    # last date 244 served, the append would rewrite already-served history
+    # (2026-09-28 incident: run 84dcd7c2 rewrote 2026-09-21..24).  Refuse unless
+    # sanctioned AND the tail is current (or --force-append).
+    if skip_train or mode == "append":
+        host = assert_serving_machine(force=force_append)
+        print(f"  [serving-guard] host = {host} (sanctioned append origin, OK)")
+        assert_served_tail_not_ahead(
+            _combined_pred_tail(exp_name), force=force_append
+        )
 
     _RollingCls = Rolling if mode == "full" else AppendRolling
     rolling = _RollingCls(
@@ -336,6 +376,16 @@ def main(skip_train: bool = False, mode: str = "append", conf: str = None,
     # a previous run already served now has a different target (retroactive rewrite
     # -> live churn). See determinism_guard.py.
     record_and_check_positions(exp_name=exp_name)
+
+    # Record the last-served date so a later append on ANY machine can detect that
+    # its local combined pred is stale relative to what the serving pipeline already
+    # consumed (serving_guard).  Only the CONSUMING machine writes it, so a
+    # training-machine run cannot corrupt the authoritative served-tail file.
+    if current_host() in consumer_hosts():
+        tail = _combined_pred_tail(exp_name)
+        if tail is not None:
+            mark_served_tail(tail)
+            print(f"  [serving-guard] recorded served tail = {tail.date()}")
 
 
 if __name__ == "__main__":
