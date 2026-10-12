@@ -407,7 +407,7 @@ def sync_positions(
     auction_wait: bool = True,
     mode: str = "daily",
     max_weight: float = 0.15,
-    retry_missed: bool = True,
+    retry_missed: bool = False,  # 2026-10-12 disabled 二轮保底 (重复买入事故, 见函数内注释)
     retry_settle_delay: float = 2.0,
     topup_enabled: bool = False,
     topup_min_lot_gap: int = 1,
@@ -718,17 +718,28 @@ def sync_positions(
         do("BUY", ths, target_stocks[code], limit_price)
 
     # ---------------------------------------------------------------------
-    # 二轮保底: 首轮循环里, 一个限价单如果股价在它上方就一直挂着不成交
-    # (典型场景是"低开高走", 限价挂在开盘参考价 x(1+slip), 全天涨过它).
-    # 这里给每只未成交的目标再一次机会:
-    #   1) 重新查询真实持仓(权威"已成交数量")  -- 基于成交数量比对, 不依赖脆弱的
-    #      F3 委托状态表列名(该表列名/空值在不同券商界面不固定, 判错风险高)
-    #   2) 对持仓仍不足目标数量的股票: 撤掉其未成交委托, 重新查最新实时价,
-    #      改用"对手价"重新挂单(买挂卖一 ask1, 卖挂买一 bid1)提高成交概率,
-    #      盘口价缺失时回退 现价 x(1±slip); 只重挂一次(保底), 不无限循环
-    #      (对手价取自当次腾讯快照的盘口, 一挂即对价成交)
+    # 二轮保底: 【2026-10-12 已禁用 (retry_missed_effective=False)】
+    #
+    # 原意: 首轮限价单若挂在现价下方(低开高走)会一直不成交, 于是等 2 秒后
+    #   重新查持仓, 对"持仓仍不足目标"的股票撤单 + 用对手价重挂一次.
+    #
+    # 禁用原因 (2026-10-12 重复买入事故, 实盘证据确凿):
+    #   首轮买入 5 只(600547/688041/600346/600584/600415)其实已成交/正在成交,
+    #   但 2 秒内 query_holdings 的成交回报尚未回显 -> held2 查到 0 -> 判为
+    #   "未成交". 紧接着的 cancel_order 对这 5 只【全部返回 success=True】
+    #   (撤单成功被当作"确实没成交"的证据), 于是全量重挂 -> 两轮都成交 ->
+    #   最终持仓 = 2 x 目标 (600547 3200/应1600, 688041 400/应200 ...),
+    #   多买 ~16.7w, 单票权重被买到 8-9% (目标仅 4-4.6%).
+    #
+    #   即 09-11 引入的 guard (daf8eb53 "撤单失败视为已成交, 跳过重挂") 依赖
+    #   "cancel_order success == 首轮未成交" 这个前提, 实测不成立: 券商对
+    #   已成交单的撤单请求仍可能返回 success -> guard 失效 -> 重复下单.
+    #
+    #   重挂的收益(救回个别低开高走未成交单)远小于重复买入的风险(权重畸变/
+    #   被动超额建仓), 故直接停用, 保留代码以备将来有可靠"未成交"判据时复用.
     # ---------------------------------------------------------------------
-    if retry_missed and not dry_run:
+    retry_missed_effective = False  # 2026-10-12 disable 二轮保底 (see comment above)
+    if retry_missed and retry_missed_effective and not dry_run:
         print(f"\n{'=' * 60}")
         print(f"  二轮保底: 等待 {retry_settle_delay}s 让首轮成交沉淀后复核持仓")
         _time.sleep(retry_settle_delay)
@@ -1043,7 +1054,7 @@ def main(
     obs_log: str = None,
     auction_wait_until: str = "09:30:00",
     auction_wait: bool = True,
-    retry_missed: bool = True,
+    retry_missed: bool = False,  # 2026-10-12 disabled 二轮保底 (重复买入事故, 见函数内注释)
     retry_settle_delay: float = 2.0,
     topup_enabled: bool = False,
     topup_min_lot_gap: int = 1,
