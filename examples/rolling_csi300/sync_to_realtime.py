@@ -682,20 +682,44 @@ def sync_positions(
     # the opposing best quote: a sell at ``bid1 - tick`` and a buy at
     # ``ask1 + tick`` hit the top of the book immediately.  Fall back to a
     # deeper 现价×(1±slippage_deep) when the book side is missing/zero.
+    #
+    # 涨跌停夹取 (2026-10-13): the crossing price may exceed the daily limit
+    # (ask1+0.01 > 涨停 on a near/sealed limit-up stock, or a stale book), which
+    # the broker also rejects.  Clamp to one tick INSIDE the limit using the
+    # Tencent snapshot's limit_up/limit_down (fields 47/48).  Skipped only when
+    # the limit price is missing.
     def _aggressive_price(code: str, side: str, snap: dict = None):
         s = (snap or snapshot).get(code) or (snap or snapshot).get(_ths_to_qlib(code)) or {}
+        up = s.get("limit_up", 0) or 0
+        dn = s.get("limit_down", 0) or 0
         if side == "SELL":
             bid = s.get("bid1", 0) or 0
             if bid > 0:
-                return round(bid - 0.01, 2), "bid1-0.01"
-            rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
-            return (round(rp * (1 - slippage_deep), 2) if rp else None), f"price-{slippage_deep:.1%}"
+                px, src = round(bid - 0.01, 2), "bid1-0.01"
+            else:
+                rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
+                if not rp:
+                    return None, f"price-{slippage_deep:.1%}"
+                px, src = round(rp * (1 - slippage_deep), 2), f"price-{slippage_deep:.1%}"
+            # never bid below 跌停价; the exact 跌停 price is also rejected, so clamp
+            # one tick above it.
+            if dn and px < dn:
+                px, src = round(dn + 0.01, 2), f"{src}→clamp跌停+0.01"
+            return px, src
         else:
             ask = s.get("ask1", 0) or 0
             if ask > 0:
-                return round(ask + 0.01, 2), "ask1+0.01"
-            rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
-            return (round(rp * (1 + slippage_deep), 2) if rp else None), f"price+{slippage_deep:.1%}"
+                px, src = round(ask + 0.01, 2), "ask1+0.01"
+            else:
+                rp = s.get("price", 0) or ref_prices.get(code) or ref_prices.get(_qlib_to_ths(code))
+                if not rp:
+                    return None, f"price+{slippage_deep:.1%}"
+                px, src = round(rp * (1 + slippage_deep), 2), f"price+{slippage_deep:.1%}"
+            # never bid above 涨停价; the exact 涨停 price is also rejected, so clamp
+            # one tick below it.
+            if up and px > up:
+                px, src = round(up - 0.01, 2), f"{src}→clamp涨停-0.01"
+            return px, src
 
     # ---- Sell stocks not in target ----
     # 已裁剪名单 (实际持有但被因子裁掉的) 单独标注, 便于复盘
