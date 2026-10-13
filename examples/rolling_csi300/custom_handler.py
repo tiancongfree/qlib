@@ -341,7 +341,19 @@ class ICTimingStrategy(DeterministicTopkDropoutStrategy):
         df["fwd"] = fwd
         df = df.dropna(subset=["fwd"])
 
-        pred = self.signal.get_signal(start_time=pd.Timestamp(start), end_time=pd.Timestamp(end))
+        # NOTE (2026-10-13): do NOT use self.signal.get_signal(start, end) for the
+        # full range here.  For a *range* get_signal resamples with method="last"
+        # and returns ONE value per instrument (index = instrument), not a per-date
+        # score series.  Joining that instrument-only frame with the per-date
+        # forward returns produced a NON-CAUSAL "IC": the trailing-IC / risk_degree
+        # path then depended on the last-day scores, so simply extending the data by
+        # one day (every daily run) rewrote historical targets (the daily
+        # target-churn bug).  Use the cached per-date signal directly; the inner
+        # join with `fwd` (truncated to end) keeps the computation causal.
+        sig = getattr(self.signal, "signal_cache", None)
+        if sig is None:  # fallback for exotic signal objects
+            sig = self.signal.get_signal(start_time=pd.Timestamp(start), end_time=pd.Timestamp(end))
+        pred = sig
         if isinstance(pred, pd.DataFrame):
             pred = pred.iloc[:, 0]
         p = pred.to_frame("score")
