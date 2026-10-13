@@ -994,6 +994,58 @@ python3 run_rolling.py --skip-train --conf rolling_config.yaml --exp-name rollin
 - **只在 target 未持有 (8)**: 601127/688041/688506/603986/300308/002371/688521/002384 — **全是贵价/科创板**, 即 §7d-bis "整手化买不起"死角 (物理配不起, 非逻辑偏离)。AGENTS 归因: 贵价股近1年净贡献≈0 → **不建议为补齐而强买** (会把单票权重撑爆)
 - **结论**: 这 8 只不算实质偏离; 24 只已 95.8% 贴合 (且贴的是"被改写过的" target)。冻结生效后 target 不再跳变 → 持仓自然稳。
 
+## 10-13 churn 第七处根因→已修复: ICTiming `_precompute_ic` 的 IC 非因果 (2026-10-13, commit `60000db4`, 重要!)
+
+> 前六处 (08-22 / 09-07 / 09-21 / 09-23 tie-break / LightGBM 线程 / 变体残排序) 修完后，**target 仍每天被改写**。本次定位到 ICTiming 择时信号本身：它的 IC 是从**非因果**输入算出来的。
+
+### 症状 (决定性)
+- `det-guard` **几乎每天**都报 `TARGET REWRITE DETECTED`，且数量巨大: 10-09 **127 天** / 10-12 **64 天** / 10-13 **19 天** (2025-02-27~03-25)。
+- 同日不同 run 之间还会 **flip-flop**（如 2025-02-27: 10-09=29只 → 10-12=30只 → 10-13=29只）。
+
+### 逐项排除 (全部实测)
+- **pred 逐字节相同**: 10-09/10-12/10-13 三 run 的 `pred.pkl` maxdiff=0 (490k 行)。
+- **历史数据稳定**: env1 与 244 的 827 只被重写 bin，逐位比较**只有末尾多一行**（append），历史值不动；`csi300.txt`/`all.txt` 只改段末日期，成分不变。
+- **同日确定**: 同数据下用 6 个不同 `PYTHONHASHSEED` 跑 `run_rolling --skip-train`，`positions_*.csv` md5 **全一致**。
+- **不是 end_time 本身**: 把日历截到 10-09 能复现异常 (run `39407c3d5300` 的 positions 止于 10-09 且持 SH688256)，但——**注意 `save_positions.py` 与 `determinism_guard` 都挑"positions 日期最大"的 run**，环境里一旦有更长 tail 的旧 run，它们会比对错对象，诊断时会误判。
+
+### 根因
+给 `DeterministicTopkDropoutStrategy.generate_trade_decision` 加日志，**首个分叉点是 `risk_degree`**:
+```
+2020-03-02  rd=0.95   (数据到 10-12)
+2020-03-02  rd=0.5    (数据到 10-09)
+```
+risk_degree 来自 `ICTimingStrategy._precompute_ic`。直接实例化策略打印真实 IC:
+- IC 序列竟从 **2005-04-08** 开始 (pred 明明只到 2020) → join 错位；
+- `_current_ic(2020-03-02)` = **0.0548 (到10-12)** vs **0.0373 (到10-09)** → 跨过 `ic_low=0.04`，rd 在 0.95/0.5 翻转，再顺 n_drop=1 路径把历史 target 全改写。
+
+代码 bug (`custom_handler.py` `ICTimingStrategy._precompute_ic`):
+```python
+pred = self.signal.get_signal(start_time=start, end_time=end)   # 传整段区间
+```
+`SignalWCache.get_signal(整段区间)` 用 `resam_ts_data(..., method="last")` **塌缩成"每只股票的最后一个分数"(index 只有 instrument)**，再和逐日 `fwd` 做 inner join → **非因果 IC**（拿最新一天分数解释所有历史日）。所以**数据每多一天，整条 IC/risk_degree 路径就变一次** → 历史 target 被重写。**AGENTS §8 写的"前瞻20天 / 因果滞后 / 无未来函数"实际从未生效**（旧 IC 反而含 look-ahead）。
+
+### 修复 (`60000db4`: `custom_handler.py` 的 `_precompute_ic`)
+用逐日缓存替代会塌缩的 `get_signal`:
+```python
+sig = getattr(self.signal, "signal_cache", None)   # (datetime,instrument) 逐日
+if sig is None: sig = self.signal.get_signal(start_time=..., end_time=...)  # 兜底
+pred = sig
+```
+inner join `fwd`(≤end) 保证因果。
+
+### 验证
+- IC 改从 **2020-01-02** 开始，`_current_ic(2020-03-02)` 两端都是 1.0；
+- 同数据同一份代码，**数据到 10-12 与到 10-09 的 1638 条历史决策逐行完全相同**（只差最后一天 10-12）；
+- 重跑 244 daily flow: `det-guard ... status=OK`（不再报改写）。
+- **绩效基本持平**（excess 不含成本: 16.63% / IR 1.245 / dd -22.2% vs 旧 15.88% / 1.234 / -19.1%）。
+
+### 部署 (2026-10-13)
+- 本机 commit `60000db4` → push `congt` → 244 `git pull` 快进 `d4b024e1 → 60000db4`；`custom_handler.py` md5 两机一致 (`f77988d2…`)。
+- 244 重跑 `run_workflow.py --skip-train`（**含 sync**）: 一次性大挪动 — SELL 600584/301308/688506、BUY 688012/603986（均 OK），账户对齐新 target (31 只, 总市值 698,171)。
+- ⚠️ **运维坑**: `run_workflow.py` 用 `fire`，跳过同步要写 **`--sync=False`**（我误写 `--no-sync` → fire 不认、按默认 `sync=True` 跑了，退出码 2 但流程已完整执行完毕）。
+- ⚠️ 该次更新的 `update_baostock` 做了**全量 5566 只**下载，600s 超时（数据仍止于 10-12，append-only 无影响；下次定时更新会补 10-13）。
+- **附带效果**: 修复会**一次性改变 target**（因 risk_degree 路径变正确），之后应稳定不再改写。
+
 ## 回撤邮件提醒 (dd_alert.py, 2026-08-13)
 
 ### 功能
